@@ -9,3 +9,6 @@ description = "SQL Schema Generator and Foreign Key Join Test Tool"
 rand = "0.8"
 postgres = "0.19"
 clap = { version = "4.4", features = ["derive"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1.4", features = ["v4"] }
+ctrlc = "3.4"
