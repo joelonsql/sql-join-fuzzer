@@ -246,6 +246,7 @@ LEFT JOIN table2 AS t2 ON t2.fk_col = t1.pk_col
 2. KEY syntax (proposed SQL feature):
 ```sql
 LEFT JOIN table2 AS t2 KEY (fk_col) -> t1 (pk_col)
+LEFT JOIN table1 AS t1 KEY (pk_col) <- t2 (fk_col)
 ```
 
 Select the syntax style using the `--join-syntax` option with either `ON` or `KEY`.
