@@ -84,6 +84,18 @@ struct Args {
     /// 'ON' for traditional syntax
     #[arg(long, default_value = "ON")]
     join_syntax: String,
+
+    /// Statement timeout in milliseconds
+    #[arg(long, default_value_t = 5000)]
+    statement_timeout_ms: u32,
+
+    /// Minimum number of joins to generate
+    #[arg(long, default_value_t = 1)]
+    min_num_joins: usize,
+
+    /// Maximum number of joins to generate
+    #[arg(long, default_value_t = 5)]
+    max_num_joins: usize,
 }
 
 static GLOBAL_COLUMN_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -614,6 +626,8 @@ fn generate_fk_join_query(tables: &[Table], num_joins: usize, rng: &mut impl Rng
 fn main() {
     let args = Args::parse();
 
+    let mut first_output = true;  // Track if this is our first output
+
     loop {
         let mut output = Vec::new();  // Buffer for SQL statements
 
@@ -796,7 +810,12 @@ fn main() {
 
         // Generate insert statements
         if let Ok(_) = generate_insert_statements(&tables, &mut rng, &mut output, &args) {
-            if let Some((first_table, joins)) = generate_fk_join_query(&tables, 5, &mut rng, &args) {
+            let num_joins = if args.max_num_joins > args.min_num_joins {
+                rng.gen_range(args.min_num_joins..=args.max_num_joins)
+            } else {
+                args.min_num_joins
+            };
+            if let Some((first_table, joins)) = generate_fk_join_query(&tables, num_joins, &mut rng, &args) {
                 // Track tables in order of appearance, using their aliases
                 let mut table_aliases = Vec::new();
                 table_aliases.push((first_table.clone(), first_table.clone()));
@@ -812,6 +831,15 @@ fn main() {
                 // Get theoretical results
                 let (theoretical_a, theoretical_u) = verify_derived_table(&first_table, &joins);
 
+                // Before executing view_sql, print the theoretical sets:
+                if !first_output {
+                    print!("\x1B[3F\x1B[0J");
+                }
+                println!("A: {}", format!("{{{}}}", theoretical_a.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+                println!("U: {}", format!("{{{}}}", theoretical_u.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+                println!("");  // Extra line for status messages
+                first_output = false;
+
                 // Connect to PostgreSQL and execute
                 let db_user = args.db_user.clone().unwrap_or_else(|| env::var("USER").unwrap_or_else(|_| "postgres".to_string()));
                 let conn_string = format!(
@@ -825,6 +853,13 @@ fn main() {
 
                 match Client::connect(&conn_string, NoTls) {
                     Ok(mut client) => {
+                        // Set statement timeout right after connecting
+                        if let Err(e) = client.batch_execute(&format!("SET statement_timeout = '{}';", args.statement_timeout_ms)) {
+                            let filename = save_error_sql(&output, &e, Some(&format!("SET statement_timeout = '{}';", args.statement_timeout_ms)));
+                            eprintln!("SQL saved to {}", filename);
+                            std::process::exit(1);
+                        }
+
                         // Execute schema reset and SQL statements
                         if let Err(e) = client.batch_execute(&format!("DROP SCHEMA IF EXISTS {} CASCADE; CREATE SCHEMA {}; SET search_path TO {};",
                             args.db_name, args.db_name, args.db_name)) {
@@ -856,34 +891,33 @@ fn main() {
                             std::process::exit(1);
                         }
 
-                        // Execute verification query
+                        // Execute verification query (now without setting timeout again)
                         match client.query_one(&verify_sql, &[]) {
                             Ok(row) => {
                                 let practical_a: Vec<String> = row.get(0);
                                 let practical_u: Vec<String> = row.get(1);
 
-                                let practical_a_set: std::collections::HashSet<_> =
-                                    practical_a.into_iter().collect();
-                                let practical_u_set: std::collections::HashSet<_> =
-                                    practical_u.into_iter().collect();
+                                let practical_a_set: std::collections::HashSet<_> = practical_a.into_iter().collect();
+                                let practical_u_set: std::collections::HashSet<_> = practical_u.into_iter().collect();
 
-                                // Sort the elements for easier comparison
-                                let mut theoretical_a_vec: Vec<_> = theoretical_a.iter().collect();
-                                let mut theoretical_u_vec: Vec<_> = theoretical_u.iter().collect();
-                                let mut practical_a_vec: Vec<_> = practical_a_set.iter().collect();
-                                let mut practical_u_vec: Vec<_> = practical_u_set.iter().collect();
+                                // Create sorted string representations
+                                let theoretical_a_str = format!("{{{}}}", theoretical_a.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+                                let theoretical_u_str = format!("{{{}}}", theoretical_u.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+                                let practical_a_str = format!("{{{}}}", practical_a_set.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+                                let practical_u_str = format!("{{{}}}", practical_u_set.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
 
-                                theoretical_a_vec.sort();
-                                theoretical_u_vec.sort();
-                                practical_a_vec.sort();
-                                practical_u_vec.sort();
-
-                                // Print results with sorted elements
-                                println!("Results:");
-                                println!("Theoretical A: {:?}", theoretical_a_vec);
-                                println!("Practical A:   {:?}", practical_a_vec);
-                                println!("Theoretical U: {:?}", theoretical_u_vec);
-                                println!("Practical U:   {:?}", practical_u_vec);
+                                // Print results
+                                print!("\x1B[3F\x1B[0J");  // Move up 3 lines and clear them
+                                println!("A: {} {} {}",
+                                    theoretical_a_str,
+                                    if theoretical_a.is_subset(&practical_a_set) { "⊆" } else { "⊈" },
+                                    practical_a_str
+                                );
+                                println!("U: {} {} {}",
+                                    theoretical_u_str,
+                                    if theoretical_u.is_subset(&practical_u_set) { "⊆" } else { "⊈" },
+                                    practical_u_str
+                                );
 
                                 // Check for errors
                                 let mut error_msg = String::new();
@@ -914,9 +948,8 @@ fn main() {
 
                                 // Check if this case already exists
                                 if std::path::Path::new(&filename).exists() {
-                                    println!("Case with {} elements in A and {} elements in U already exists, skipping...",
-                                        theoretical_a.len(), theoretical_u.len());
-                                    continue; // Continue the main loop instead of breaking
+                                    println!("");
+                                    continue;
                                 }
 
                                 // Log successful new case
@@ -926,10 +959,10 @@ fn main() {
                                 writeln!(log, "-- New case with {} elements in A and {} elements in U",
                                     theoretical_a.len(), theoretical_u.len()).expect("Failed to write to log");
                                 writeln!(log, "-- Results:").expect("Failed to write to log");
-                                writeln!(log, "-- Theoretical A: {:?}", theoretical_a_vec).expect("Failed to write to log");
-                                writeln!(log, "-- Practical A:   {:?}", practical_a_vec).expect("Failed to write to log");
-                                writeln!(log, "-- Theoretical U: {:?}", theoretical_u_vec).expect("Failed to write to log");
-                                writeln!(log, "-- Practical U:   {:?}", practical_u_vec).expect("Failed to write to log");
+                                writeln!(log, "-- Theoretical A: {}", theoretical_a_str).expect("Failed to write to log");
+                                writeln!(log, "-- Practical A:   {}", practical_a_str).expect("Failed to write to log");
+                                writeln!(log, "-- Theoretical U: {}", theoretical_u_str).expect("Failed to write to log");
+                                writeln!(log, "-- Practical U:   {}", practical_u_str).expect("Failed to write to log");
                                 writeln!(log).expect("Failed to write to log");
 
                                 // Write all SQL statements
@@ -945,9 +978,15 @@ fn main() {
                                 println!("Found new case! Saved to {}", filename);
                             }
                             Err(e) => {
-                                let filename = save_error_sql(&output, &e, Some(&verify_sql));
-                                eprintln!("SQL saved to {}", filename);
-                                std::process::exit(1);
+                                if e.to_string().contains("statement timeout") {
+                                    print!("\x1B[1F\x1B[0J");  // Move up 1 line and clear them
+                                    println!("Verification query timed out after {} ms, skipping...", args.statement_timeout_ms);
+                                    continue;  // Skip this case and continue with the next one
+                                } else {
+                                    let filename = save_error_sql(&output, &e, Some(&verify_sql));
+                                    eprintln!("SQL saved to {}", filename);
+                                    std::process::exit(1);
+                                }
                             }
                         }
                     }
