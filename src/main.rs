@@ -79,6 +79,11 @@ struct Args {
     /// Database password
     #[arg(long, default_value = "")]
     db_password: String,
+
+    /// Join syntax to use: 'KEY' for foreign key syntax or
+    /// 'ON' for traditional syntax
+    #[arg(long, default_value = "ON")]
+    join_syntax: String,
 }
 
 static GLOBAL_COLUMN_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -801,7 +806,7 @@ fn main() {
                 }
 
                 // Create view and verification queries
-                let view_sql = create_view_sql(&first_table, &joins, &table_aliases);
+                let view_sql = create_view_sql(&first_table, &joins, &table_aliases, &args.join_syntax);
                 let verify_sql = create_verify_sql(&table_aliases);
 
                 // Get theoretical results
@@ -821,28 +826,33 @@ fn main() {
                 match Client::connect(&conn_string, NoTls) {
                     Ok(mut client) => {
                         // Execute schema reset and SQL statements
-                        if let Err(e) = client.batch_execute(&format!("DROP SCHEMA IF EXISTS {} CASCADE; CREATE SCHEMA {}; SET search_path TO {};", args.db_name, args.db_name, args.db_name)) {
+                        if let Err(e) = client.batch_execute(&format!("DROP SCHEMA IF EXISTS {} CASCADE; CREATE SCHEMA {}; SET search_path TO {};",
+                            args.db_name, args.db_name, args.db_name)) {
                             eprintln!("\nError: Failed to reset database schema");
                             eprintln!("Details: {}", e);
                             eprintln!("\nPlease check:");
                             eprintln!("1. Is PostgreSQL running?");
                             eprintln!("2. Can you connect to {}:{} ?", args.db_host, args.db_port);
                             eprintln!("3. Does user '{}' have permission to create schemas?", db_user);
-                            save_error_sql(&output, &e);
+                            let filename = save_error_sql(&output, &e, Some(&format!("DROP SCHEMA IF EXISTS {} CASCADE; CREATE SCHEMA {}; SET search_path TO {};",
+                                args.db_name, args.db_name, args.db_name)));
+                            eprintln!("SQL saved to {}", filename);
                             std::process::exit(1);
                         }
 
                         // Execute statements and handle errors
                         for sql in &output {
                             if let Err(e) = client.batch_execute(sql) {
-                                save_error_sql(&output, &e);
+                                let filename = save_error_sql(&output, &e, Some(sql));
+                                eprintln!("SQL saved to {}", filename);
                                 std::process::exit(1);
                             }
                         }
 
                         // Execute view creation
                         if let Err(e) = client.batch_execute(&view_sql) {
-                            save_error_sql(&output, &e);
+                            let filename = save_error_sql(&output, &e, Some(&view_sql));
+                            eprintln!("SQL saved to {}", filename);
                             std::process::exit(1);
                         }
 
@@ -894,7 +904,8 @@ fn main() {
                                 }
 
                                 if !error_msg.is_empty() {
-                                    save_error_sql(&output, &error_msg);
+                                    let filename = save_error_sql(&output, &error_msg, Some(&verify_sql));
+                                    eprintln!("SQL saved to {}", filename);
                                     std::process::exit(1);
                                 }
 
@@ -934,7 +945,8 @@ fn main() {
                                 println!("Found new case! Saved to {}", filename);
                             }
                             Err(e) => {
-                                save_error_sql(&output, &e);
+                                let filename = save_error_sql(&output, &e, Some(&verify_sql));
+                                eprintln!("SQL saved to {}", filename);
                                 std::process::exit(1);
                             }
                         }
@@ -950,7 +962,8 @@ fn main() {
                         eprintln!("   - User: {}", db_user);
                         eprintln!("   - Host: {}", args.db_host);
                         eprintln!("   - Port: {}", args.db_port);
-                        save_error_sql(&output, &e);
+                        let filename = save_error_sql(&output, &e, Some(&conn_string));
+                        eprintln!("SQL saved to {}", filename);
                         std::process::exit(1);
                     }
                 }
@@ -959,7 +972,7 @@ fn main() {
     }
 }
 
-fn save_error_sql(output: &[String], error: &impl std::fmt::Display) {
+fn save_error_sql(output: &[String], error: &impl std::fmt::Display, failed_query: Option<&str>) -> String {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -969,19 +982,33 @@ fn save_error_sql(output: &[String], error: &impl std::fmt::Display) {
     let mut file = File::create(&filename).expect("Failed to create error file");
 
     writeln!(file, "-- Error: {}\n", error).expect("Failed to write error");
+
+    // Write all previous SQL statements
     for sql in output {
         writeln!(file, "{}", sql).expect("Failed to write SQL");
     }
 
-    println!("Error encountered! SQL saved to {}", filename);
+    // Write the failing query if provided
+    if let Some(query) = failed_query {
+        writeln!(file, "\n-- Query that caused the error:").expect("Failed to write comment");
+        writeln!(file, "{}", query).expect("Failed to write failing query");
+    }
+
+    filename
 }
 
 // Add these helper functions
-fn create_view_sql(first_table: &str, joins: &[JoinInfo], table_aliases: &[(String, String)]) -> String {
+fn create_view_sql(first_table: &str, joins: &[JoinInfo], table_aliases: &[(String, String)], join_syntax: &str) -> String {
     let mut sql = String::from("-- This view represents the derived table created by the join sequence.\n");
     sql.push_str("-- Each table's ID is selected to track which rows from the base tables appear in the result.\n");
-    sql.push_str("-- The join sequence uses the KEY syntax to specify foreign key relationships.\n");
-    sql.push_str("-- Arrows (->, <-) indicate the direction of the foreign key constraint.\n");
+
+    if join_syntax.to_uppercase() == "KEY" {
+        sql.push_str("-- The join sequence uses the KEY syntax to specify foreign key relationships.\n");
+        sql.push_str("-- Arrows (->, <-) indicate the direction of the foreign key constraint.\n");
+    } else {
+        sql.push_str("-- The join sequence uses traditional ON syntax for joins.\n");
+    }
+
     sql.push_str("CREATE VIEW v AS\nSELECT\n");
 
     let id_columns: Vec<_> = table_aliases.iter()
@@ -992,14 +1019,25 @@ fn create_view_sql(first_table: &str, joins: &[JoinInfo], table_aliases: &[(Stri
 
     sql.push_str(&format!("FROM {}\n", first_table));
     for join in joins {
-        sql.push_str(&format!("{} JOIN {} AS {} KEY ({}) {} {} ({})\n",
-            join.join_type.as_str(),
-            join.new_table,
-            join.new_alias,
-            join.new_table_col,
-            join.arrow.as_str(),
-            join.existing_alias,
-            join.existing_table_col));
+        if join_syntax.to_uppercase() == "KEY" {
+            sql.push_str(&format!("{} JOIN {} AS {} KEY ({}) {} {} ({})\n",
+                join.join_type.as_str(),
+                join.new_table,
+                join.new_alias,
+                join.new_table_col,
+                join.arrow.as_str(),
+                join.existing_alias,
+                join.existing_table_col));
+        } else {
+            sql.push_str(&format!("{} JOIN {} AS {} ON {}.{} = {}.{}\n",
+                join.join_type.as_str(),
+                join.new_table,
+                join.new_alias,
+                join.new_alias,
+                join.new_table_col,
+                join.existing_alias,
+                join.existing_table_col));
+        }
     }
     sql.push_str(";");
     sql

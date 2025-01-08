@@ -139,7 +139,7 @@ These conditions indicate potential flaws in the theoretical model and are repor
 1. Clone the repository
 2. Install dependencies:
 ```bash
-cargo build
+cargo build --release
 ```
 
 ## Configuration
@@ -165,12 +165,16 @@ cargo run
 Or specify custom parameters:
 
 ```bash
-sql-join-fuzzer --num-tables 10 --avg-columns 8 --max-rows-per-table 500
+./target/release/sql-join-fuzzer --join-syntax KEY
 ```
 
 ### Command Line Options
 
 ```
+SQL Schema Generator and Foreign Key Join Test Tool
+
+Usage: sql-join-fuzzer [OPTIONS]
+
 Options:
       --num-tables <NUM_TABLES>
           Number of tables to generate [default: 5]
@@ -206,6 +210,8 @@ Options:
           Database user
       --db-password <DB_PASSWORD>
           Database password [default: ]
+      --join-syntax <JOIN_SYNTAX>
+          Join syntax to use: 'KEY' for foreign key syntax or 'ON' for traditional syntax [default: ON]
   -h, --help
           Print help
   -V, --version
@@ -227,3 +233,19 @@ The tool will:
 ## License
 
 PostgreSQL License
+
+### Join Syntax Examples
+
+The tool supports two join syntax styles:
+
+1. Traditional ON syntax (default):
+```sql
+LEFT JOIN table2 AS t2 ON t2.fk_col = t1.pk_col
+```
+
+2. KEY syntax (proposed SQL feature):
+```sql
+LEFT JOIN table2 AS t2 KEY (fk_col) -> t1 (pk_col)
+```
+
+Select the syntax style using the `--join-syntax` option with either `ON` or `KEY`.
