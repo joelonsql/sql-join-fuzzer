@@ -1,0 +1,10 @@
+[package]
+name = "sql-join-fuzzer"
+version = "0.1.0"
+edition = "2021"
+authors = ["Joel Jakobsson <github@compiler.org>"]
+description = "SQL Schema Generator and Foreign Key Join Test Tool"
+
+[dependencies]
+rand = "0.8.5"
+postgres = "0.19"
