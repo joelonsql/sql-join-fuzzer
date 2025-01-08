@@ -77,7 +77,7 @@ struct TableData {
 fn generate_insert_statements(tables: &[Table], rng: &mut impl Rng, output: &mut Vec<String>) -> Result<(), String> {
     let mut sequences: std::collections::HashMap<(String, String), ColumnSequence> = std::collections::HashMap::new();
     let mut table_data: std::collections::HashMap<String, TableData> = std::collections::HashMap::new();
-    
+
     // Initialize sequences and table data
     for table in tables {
         for column in &table.columns {
@@ -92,21 +92,21 @@ fn generate_insert_statements(tables: &[Table], rng: &mut impl Rng, output: &mut
             sequences: std::collections::HashMap::new(),
         });
     }
-    
+
     for table in tables {
         output.push(format!("\n-- INSERT statements for table {}", table.name));
-        
+
         for sequence in sequences.values_mut() {
             sequence.clear_current_table();
         }
-        
+
         let target_rows = rng.gen_range(MIN_ROWS_PER_TABLE..=MAX_ROWS_PER_TABLE);
         let mut successful_inserts = 0;
-        
+
         'row_loop: for _ in 0..target_rows {
             let mut values = Vec::new();
             let mut row_data: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
-            
+
             for column in &table.columns {
                 let value = if column.is_foreign_key {
                     if !column.is_not_null && rng.gen_bool(FOREIGN_KEY_NULL_PROB) {
@@ -114,24 +114,24 @@ fn generate_insert_statements(tables: &[Table], rng: &mut impl Rng, output: &mut
                     } else {
                         let (ref_table, ref_col) = column.reference.as_ref().unwrap();
                         let ref_table_data = table_data.get(ref_table).unwrap();
-                        
+
                         // Create longer-lived empty vectors
                         let empty_vec = Vec::new();
                         let available_values = ref_table_data.sequences.get(ref_col).unwrap_or(&empty_vec);
                         if available_values.is_empty() {
                             continue 'row_loop;
                         }
-                        
+
                         if column.is_unique {
                             let empty_vec = Vec::new();
                             let used_values = table_data.get(&table.name)
                                 .and_then(|td| td.sequences.get(&column.name))
                                 .unwrap_or(&empty_vec);
-                            
+
                             let available: Vec<_> = available_values.iter()
                                 .filter(|v| !used_values.contains(v))
                                 .collect();
-                            
+
                             if available.is_empty() {
                                 continue 'row_loop;
                             }
@@ -164,17 +164,17 @@ fn generate_insert_statements(tables: &[Table], rng: &mut impl Rng, output: &mut
                         rng.gen_range(1..1000)
                     }
                 };
-                
+
                 values.push(value);
                 if value != -1 {
                     row_data.insert(column.name.clone(), value);
                 }
             }
-            
+
             let column_names: Vec<String> = table.columns.iter()
                 .map(|c| c.name.clone())
                 .collect();
-            
+
             output.push(format!("INSERT INTO {} ({}) VALUES ({});",
                 table.name,
                 column_names.join(", "),
@@ -182,18 +182,18 @@ fn generate_insert_statements(tables: &[Table], rng: &mut impl Rng, output: &mut
                     .map(|&v| if v == -1 { "NULL".to_string() } else { v.to_string() })
                     .collect::<Vec<_>>()
                     .join(", ")));
-            
+
             let table_data = table_data.get_mut(&table.name).unwrap();
             for (col_name, value) in row_data {
                 table_data.sequences.entry(col_name)
                     .or_insert_with(Vec::new)
                     .push(value);
             }
-            
+
             successful_inserts += 1;
         }
-        
-        output.push(format!("-- Generated {} out of {} attempted rows for {}", 
+
+        output.push(format!("-- Generated {} out of {} attempted rows for {}",
             successful_inserts, target_rows, table.name));
 
         if successful_inserts < MIN_ROWS_PER_TABLE {
@@ -342,8 +342,8 @@ fn verify_derived_table(first_table: &str, joins: &[JoinInfo]) -> (std::collecti
 }
 
 // Modify generate_fk_join_query to return metadata needed for verification
-fn generate_fk_join_query(tables: &[Table], num_joins: usize, rng: &mut impl Rng) 
-    -> Option<(String, Vec<JoinInfo>)> 
+fn generate_fk_join_query(tables: &[Table], num_joins: usize, rng: &mut impl Rng)
+    -> Option<(String, Vec<JoinInfo>)>
 {
     // Collect all foreign key relationships
     let mut fk_relationships: Vec<(String, String, String, String)> = Vec::new(); // (ref_table, ref_col, fk_table, fk_col)
@@ -368,9 +368,9 @@ fn generate_fk_join_query(tables: &[Table], num_joins: usize, rng: &mut impl Rng
     // Pick first relationship
     let first_rel = fk_relationships.choose(rng)?;
     let join_types = [JoinType::Inner, JoinType::Left, JoinType::Right, JoinType::Full];
-    
+
     let mut joins = Vec::new();  // Initialize joins vector
-    
+
     // Track table aliases instead of just table names
     let mut used_aliases = Vec::new();
     let mut alias_counter: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -406,7 +406,7 @@ fn generate_fk_join_query(tables: &[Table], num_joins: usize, rng: &mut impl Rng
             return None;
         }
         let new_alias = get_alias(&first_rel.2, &mut alias_counter);
-        
+
         // Find the foreign key column to get its properties
         let fk_table = tables.iter().find(|t| t.name == first_rel.2).unwrap();
         let fk_col = fk_table.columns.iter()
@@ -433,7 +433,7 @@ fn generate_fk_join_query(tables: &[Table], num_joins: usize, rng: &mut impl Rng
             return None;
         }
         let new_alias = get_alias(&first_rel.0, &mut alias_counter);
-        
+
         // Find the foreign key column to get its properties
         let fk_table = tables.iter().find(|t| t.name == first_rel.2).unwrap();
         let fk_col = fk_table.columns.iter()
@@ -464,7 +464,7 @@ fn generate_fk_join_query(tables: &[Table], num_joins: usize, rng: &mut impl Rng
             .filter(|(ref_table, _, fk_table, _)| {
                 let ref_table_used = used_aliases.iter().any(|a| &a.table_name == ref_table);
                 let fk_table_used = used_aliases.iter().any(|a| &a.table_name == fk_table);
-                
+
                 // If both tables are used, only include with TABLE_REUSE_PROB probability
                 if ref_table_used && fk_table_used {
                     rng.gen_bool(TABLE_REUSE_PROB)
@@ -481,7 +481,7 @@ fn generate_fk_join_query(tables: &[Table], num_joins: usize, rng: &mut impl Rng
 
         let rel = valid_relationships.choose(rng).unwrap();
         let ref_table_is_used = used_aliases.iter().any(|a| a.table_name == rel.0);
-        
+
         if ref_table_is_used {
             let new_alias = get_alias(&rel.2, &mut alias_counter);
             let existing_alias = used_aliases.iter()
@@ -564,20 +564,20 @@ fn generate_fk_join_query(tables: &[Table], num_joins: usize, rng: &mut impl Rng
 }
 
 fn main() {
-    // Create or truncate the log file at start
-    std::fs::write("fkjoinstest.sql", "").expect("Failed to create log file");
-
     loop {
         let mut attempt = 1;
         let mut output = Vec::new();  // Buffer for SQL statements
-        
+
         'attempt: loop {
             output.clear();
             println!("-- Attempt #{}", attempt);
-            
+
+            // Reset the column counter at the start of each attempt
+            GLOBAL_COLUMN_COUNTER.store(1, Ordering::SeqCst);
+
             let mut rng = thread_rng();
             let mut tables: Vec<Table> = Vec::with_capacity(NUM_TABLES);
-            
+
             // Reference candidates: PK or UNIQUE columns from previous tables
             let mut reference_candidates: Vec<(String, String)> = Vec::new();
 
@@ -676,7 +676,7 @@ fn main() {
                 final_columns.push(main_key_col);
                 final_columns.extend_from_slice(fk_cols);
                 final_columns.extend_from_slice(normal_cols);
-                
+
                 // Sort columns by extracting the number from the column name and comparing
                 final_columns.sort_by_key(|col| {
                     col.name
@@ -731,7 +731,7 @@ fn main() {
 
                 let total_items = table.columns.len() + constraints.len();
                 let mut items_printed = 0;
-                
+
                 // Add columns
                 for column in &table.columns {
                     items_printed += 1;
@@ -767,8 +767,8 @@ fn main() {
                     if let Some((first_table, joins)) = generate_fk_join_query(&tables, 5, &mut rng) {
                         // Track tables in order of appearance, using their aliases
                         let mut table_aliases = Vec::new();
-                        table_aliases.push((first_table.clone(), first_table.clone())); 
-                        
+                        table_aliases.push((first_table.clone(), first_table.clone()));
+
                         for join in &joins {
                             table_aliases.push((join.new_table.clone(), join.new_alias.clone()));
                         }
@@ -776,7 +776,7 @@ fn main() {
                         // Create view and verification queries
                         let view_sql = create_view_sql(&first_table, &joins, &table_aliases);
                         let verify_sql = create_verify_sql(&table_aliases);
-                        
+
                         // Get theoretical results
                         let (theoretical_a, theoretical_u) = verify_derived_table(&first_table, &joins);
 
@@ -814,10 +814,10 @@ fn main() {
                                     Ok(row) => {
                                         let practical_a: Vec<String> = row.get(0);
                                         let practical_u: Vec<String> = row.get(1);
-                                        
-                                        let practical_a_set: std::collections::HashSet<_> = 
+
+                                        let practical_a_set: std::collections::HashSet<_> =
                                             practical_a.into_iter().collect();
-                                        let practical_u_set: std::collections::HashSet<_> = 
+                                        let practical_u_set: std::collections::HashSet<_> =
                                             practical_u.into_iter().collect();
 
                                         // Only print results
@@ -829,7 +829,7 @@ fn main() {
 
                                         // Check for errors
                                         let mut error_msg = String::new();
-                                        
+
                                         if !theoretical_a.is_subset(&practical_a_set) {
                                             error_msg.push_str(&format!(
                                                 "Theoretical A is not a subset of practical A\n\
@@ -840,24 +840,32 @@ fn main() {
                                         if !theoretical_u.is_subset(&practical_u_set) {
                                             error_msg.push_str(&format!(
                                                 "Theoretical U is not a subset of practical U\n\
-                                                Extra in theoretical U: {:?}\n", 
+                                                Extra in theoretical U: {:?}\n",
                                                 theoretical_u.difference(&practical_u_set).collect::<Vec<_>>()
                                             ));
                                         }
-                                        
+
                                         if !error_msg.is_empty() {
                                             save_error_sql(&output, &error_msg);
                                             std::process::exit(1);
                                         }
 
-                                        // Log successful attempt - truncate file first
-                                        std::fs::write("fkjoinstest.sql", "").expect("Failed to truncate log file");
-                                        let mut log = std::fs::OpenOptions::new()
-                                            .append(true)
-                                            .open("fkjoinstest.sql")
-                                            .expect("Failed to open log file");
+                                        // Generate filename based on A and U set sizes
+                                        let filename = format!("joins_{}A_{}U.sql", theoretical_a.len(), theoretical_u.len());
 
-                                        writeln!(log, "-- Successful attempt #{}", attempt).expect("Failed to write to log");
+                                        // Check if this case already exists
+                                        if std::path::Path::new(&filename).exists() {
+                                            println!("Case with {} elements in A and {} elements in U already exists, skipping...",
+                                                theoretical_a.len(), theoretical_u.len());
+                                            break 'attempt;
+                                        }
+
+                                        // Log successful new case
+                                        let mut log = std::fs::File::create(&filename)
+                                            .expect("Failed to create log file");
+
+                                        writeln!(log, "-- New case with {} elements in A and {} elements in U",
+                                            theoretical_a.len(), theoretical_u.len()).expect("Failed to write to log");
                                         writeln!(log, "-- Results:").expect("Failed to write to log");
                                         writeln!(log, "-- Theoretical A: {:?}", theoretical_a).expect("Failed to write to log");
                                         writeln!(log, "-- Practical A:   {:?}", practical_a_set).expect("Failed to write to log");
@@ -869,9 +877,13 @@ fn main() {
                                         for sql in &output {
                                             writeln!(log, "{}", sql).expect("Failed to write to log");
                                         }
+                                        writeln!(log, "\n\n").expect("Failed to write to log");  // Add extra newline before view
                                         writeln!(log, "{}", view_sql).expect("Failed to write to log");
+                                        writeln!(log, "\n\n").expect("Failed to write to log");  // Add extra newline before verification
                                         writeln!(log, "{}", verify_sql).expect("Failed to write to log");
                                         writeln!(log, "\n").expect("Failed to write to log");
+
+                                        println!("Found new case! Saved to {}", filename);
                                     }
                                     Err(e) => {
                                         save_error_sql(&output, &e);
@@ -902,22 +914,26 @@ fn save_error_sql(output: &[String], error: &impl std::fmt::Display) {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    
+
     let filename = format!("{}.sql", timestamp);
     let mut file = File::create(&filename).expect("Failed to create error file");
-    
+
     writeln!(file, "-- Error: {}\n", error).expect("Failed to write error");
     for sql in output {
         writeln!(file, "{}", sql).expect("Failed to write SQL");
     }
-    
+
     println!("Error encountered! SQL saved to {}", filename);
 }
 
 // Add these helper functions
 fn create_view_sql(first_table: &str, joins: &[JoinInfo], table_aliases: &[(String, String)]) -> String {
-    let mut sql = String::from("CREATE VIEW v AS\nSELECT\n");
-    
+    let mut sql = String::from("-- This view represents the derived table created by the join sequence.\n");
+    sql.push_str("-- Each table's ID is selected to track which rows from the base tables appear in the result.\n");
+    sql.push_str("-- The join sequence uses the KEY syntax to specify foreign key relationships.\n");
+    sql.push_str("-- Arrows (->, <-) indicate the direction of the foreign key constraint.\n");
+    sql.push_str("CREATE VIEW v AS\nSELECT\n");
+
     let id_columns: Vec<_> = table_aliases.iter()
         .map(|(_, alias)| format!("    {}.id AS {}_id", alias, alias))
         .collect();
@@ -940,12 +956,19 @@ fn create_view_sql(first_table: &str, joins: &[JoinInfo], table_aliases: &[(Stri
 }
 
 fn create_verify_sql(table_aliases: &[(String, String)]) -> String {
-    let mut sql = String::from("SELECT\n    ARRAY[]::text[]\n");
-    
+    let mut sql = String::from("-- This query computes two properties of the derived table:\n");
+    sql.push_str("-- 1. Set A: Contains table aliases where ALL rows from the base table appear in the derived table\n");
+    sql.push_str("--    For each table T, checks if there exists any row in T that's NOT in the derived table\n");
+    sql.push_str("--    If no such row exists, T is added to set A\n");
+    sql.push_str("-- 2. Set U: Contains table aliases where rows appear at most once in the derived table\n");
+    sql.push_str("--    For each table T, checks if the count of its IDs equals the count of distinct IDs\n");
+    sql.push_str("--    If equal, T is added to set U\n");
+    sql.push_str("SELECT\n    ARRAY[]::text[]\n");
+
     // Generate A verification
     for (table, alias) in table_aliases {
         sql.push_str(&format!("    || CASE WHEN\n"));
-        sql.push_str(&format!("    NOT EXISTS (SELECT 1 FROM {} WHERE NOT EXISTS (SELECT 1 FROM v WHERE v.{}_id = {}.id))\n", 
+        sql.push_str(&format!("    NOT EXISTS (SELECT 1 FROM {} WHERE NOT EXISTS (SELECT 1 FROM v WHERE v.{}_id = {}.id))\n",
             table, alias, table));
         sql.push_str(&format!("    THEN ARRAY['{}'] END\n", alias));
     }
