@@ -7,32 +7,79 @@ use std::env;
 use std::fs::File;
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
+use clap::Parser;
 
-// ---------- Configuration Section ----------
-const NUM_TABLES: usize = 5;                          // N: total number of tables
-const AVG_COLUMNS: usize = 10;                         // Average number of columns per table
-const EXTRA_COLUMNS_RANGE: usize = 3;                 // +/- range around the average
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Number of tables to generate
+    #[arg(long, default_value_t = 5)]
+    num_tables: usize,
 
-const MAIN_KEY_PK_PROB: f64 = 0.8;                    // Probability the "main key" column is PRIMARY KEY
-const MAIN_KEY_UNIQUE_NOT_NULL_PROB: f64 = 0.5;       // Probability that if "main key" is UNIQUE, it's also NOT NULL
+    /// Average number of columns per table
+    #[arg(long, default_value_t = 10)]
+    avg_columns: usize,
 
-const ADDITIONAL_UNIQUE_PROB: f64 = 0.3;              // Probability that any additional column is UNIQUE
-const ADDITIONAL_UNIQUE_NOT_NULL_PROB: f64 = 0.5;     // Probability that a UNIQUE column is NOT NULL
+    /// +/- range around the average number of columns
+    #[arg(long, default_value_t = 3)]
+    extra_columns_range: usize,
 
-const FOREIGN_KEY_NOT_NULL_PROB: f64 = 0.5;           // Probability that a foreign key column is NOT NULL
-const FOREIGN_KEY_UNIQUE_PROB: f64 = 0.1;             // Probability that a foreign key column is UNIQUE
+    /// Probability that any additional column is UNIQUE
+    #[arg(long, default_value_t = 0.3)]
+    additional_unique_prob: f64,
 
-// The maximum number of foreign key columns is determined
-// by this percentage of the number of tables created so far (i - 1).
-const FOREIGN_KEY_MAX_PERCENT: usize = 50; // e.g., 50 means up to 50% of (i-1)
+    /// Probability that a UNIQUE column is NOT NULL
+    #[arg(long, default_value_t = 0.5)]
+    additional_unique_not_null_prob: f64,
 
-const MAX_ROWS_PER_TABLE: usize = 1000;    // Maximum number of rows to generate per table
-const MIN_ROWS_PER_TABLE: usize = 10;  // Minimum number of rows required per table
+    /// Probability that a foreign key column is NOT NULL
+    #[arg(long, default_value_t = 0.5)]
+    foreign_key_not_null_prob: f64,
 
-const FOREIGN_KEY_REUSE_PROB: f64 = 0.5;    // Probability of reusing an existing foreign key value
-const TABLE_REUSE_PROB: f64 = 0.1;    // Probability of reusing a table with a new alias
+    /// Probability that a foreign key column is UNIQUE
+    #[arg(long, default_value_t = 0.1)]
+    foreign_key_unique_prob: f64,
 
-const FOREIGN_KEY_NULL_PROB: f64 = 0.2;    // Probability of NULL for nullable foreign key columns
+    /// Maximum percentage of foreign key columns relative to previous tables
+    #[arg(long, default_value_t = 50)]
+    foreign_key_max_percent: usize,
+
+    /// Maximum number of rows per table
+    #[arg(long, default_value_t = 1000)]
+    max_rows_per_table: usize,
+
+    /// Probability of reusing an existing foreign key value
+    #[arg(long, default_value_t = 0.5)]
+    foreign_key_reuse_prob: f64,
+
+    /// Probability of reusing a table with a new alias
+    #[arg(long, default_value_t = 0.1)]
+    table_reuse_prob: f64,
+
+    /// Probability of NULL for nullable foreign key columns
+    #[arg(long, default_value_t = 0.2)]
+    foreign_key_null_prob: f64,
+
+    /// Database host
+    #[arg(long, default_value = "localhost")]
+    db_host: String,
+
+    /// Database port
+    #[arg(long, default_value_t = 5432)]
+    db_port: u16,
+
+    /// Database name
+    #[arg(long, default_value = "joinfuzzer")]
+    db_name: String,
+
+    /// Database user
+    #[arg(long)]
+    db_user: Option<String>,
+
+    /// Database password
+    #[arg(long, default_value = "")]
+    db_password: String,
+}
 
 static GLOBAL_COLUMN_COUNTER: AtomicUsize = AtomicUsize::new(1);
 
@@ -74,7 +121,7 @@ struct TableData {
     sequences: std::collections::HashMap<String, Vec<i32>>,  // column_name -> actual inserted values
 }
 
-fn generate_insert_statements(tables: &[Table], rng: &mut impl Rng, output: &mut Vec<String>) -> Result<(), String> {
+fn generate_insert_statements(tables: &[Table], rng: &mut impl Rng, output: &mut Vec<String>, args: &Args) -> Result<(), String> {
     let mut sequences: std::collections::HashMap<(String, String), ColumnSequence> = std::collections::HashMap::new();
     let mut table_data: std::collections::HashMap<String, TableData> = std::collections::HashMap::new();
 
@@ -100,7 +147,7 @@ fn generate_insert_statements(tables: &[Table], rng: &mut impl Rng, output: &mut
             sequence.clear_current_table();
         }
 
-        let target_rows = rng.gen_range(MIN_ROWS_PER_TABLE..=MAX_ROWS_PER_TABLE);
+        let target_rows = rng.gen_range(1..=args.max_rows_per_table);
         let mut successful_inserts = 0;
 
         'row_loop: for _ in 0..target_rows {
@@ -109,7 +156,7 @@ fn generate_insert_statements(tables: &[Table], rng: &mut impl Rng, output: &mut
 
             for column in &table.columns {
                 let value = if column.is_foreign_key {
-                    if !column.is_not_null && rng.gen_bool(FOREIGN_KEY_NULL_PROB) {
+                    if !column.is_not_null && rng.gen_bool(args.foreign_key_null_prob) {
                         -1  // Use -1 to represent NULL
                     } else {
                         let (ref_table, ref_col) = column.reference.as_ref().unwrap();
@@ -143,7 +190,7 @@ fn generate_insert_statements(tables: &[Table], rng: &mut impl Rng, output: &mut
                                 .and_then(|td| td.sequences.get(&column.name))
                                 .unwrap_or(&empty_vec);
 
-                            if !current_values.is_empty() && rng.gen_bool(FOREIGN_KEY_REUSE_PROB) {
+                            if !current_values.is_empty() && rng.gen_bool(args.foreign_key_reuse_prob) {
                                 // Reuse an existing value
                                 *current_values.choose(rng).unwrap()
                             } else {
@@ -195,10 +242,6 @@ fn generate_insert_statements(tables: &[Table], rng: &mut impl Rng, output: &mut
 
         output.push(format!("-- Generated {} out of {} attempted rows for {}",
             successful_inserts, target_rows, table.name));
-
-        if successful_inserts < MIN_ROWS_PER_TABLE {
-            return Err(format!("Failed to insert minimum {} rows in table {}", MIN_ROWS_PER_TABLE, table.name));
-        }
     }
 
     Ok(())
@@ -342,7 +385,7 @@ fn verify_derived_table(first_table: &str, joins: &[JoinInfo]) -> (std::collecti
 }
 
 // Modify generate_fk_join_query to return metadata needed for verification
-fn generate_fk_join_query(tables: &[Table], num_joins: usize, rng: &mut impl Rng)
+fn generate_fk_join_query(tables: &[Table], num_joins: usize, rng: &mut impl Rng, args: &Args)
     -> Option<(String, Vec<JoinInfo>)>
 {
     // Collect all foreign key relationships
@@ -467,7 +510,7 @@ fn generate_fk_join_query(tables: &[Table], num_joins: usize, rng: &mut impl Rng
 
                 // If both tables are used, only include with TABLE_REUSE_PROB probability
                 if ref_table_used && fk_table_used {
-                    rng.gen_bool(TABLE_REUSE_PROB)
+                    rng.gen_bool(args.table_reuse_prob)
                 } else {
                     // At least one table must be used
                     ref_table_used || fk_table_used
@@ -564,333 +607,331 @@ fn generate_fk_join_query(tables: &[Table], num_joins: usize, rng: &mut impl Rng
 }
 
 fn main() {
+    let args = Args::parse();
+
     loop {
-        let mut attempt = 1;
         let mut output = Vec::new();  // Buffer for SQL statements
 
-        'attempt: loop {
-            output.clear();
-            println!("-- Attempt #{}", attempt);
+        // Reset the column counter
+        GLOBAL_COLUMN_COUNTER.store(1, Ordering::SeqCst);
 
-            // Reset the column counter at the start of each attempt
-            GLOBAL_COLUMN_COUNTER.store(1, Ordering::SeqCst);
+        let mut rng = thread_rng();
+        let mut tables: Vec<Table> = Vec::with_capacity(args.num_tables);
 
-            let mut rng = thread_rng();
-            let mut tables: Vec<Table> = Vec::with_capacity(NUM_TABLES);
+        // Reference candidates: PK or UNIQUE columns from previous tables
+        let mut reference_candidates: Vec<(String, String)> = Vec::new();
 
-            // Reference candidates: PK or UNIQUE columns from previous tables
-            let mut reference_candidates: Vec<(String, String)> = Vec::new();
+        for i in 1..=args.num_tables {
+            let table_name = format!("t{}", i);
+            let mut table = Table::new(&table_name);
 
-            for i in 1..=NUM_TABLES {
-                let table_name = format!("t{}", i);
-                let mut table = Table::new(&table_name);
+            // 1) Decide how many columns for this table (around AVG_COLUMNS).
+            let lower = if args.avg_columns > args.extra_columns_range {
+                args.avg_columns - args.extra_columns_range
+            } else {
+                2 // ensure at least 2
+            };
+            let upper = args.avg_columns + args.extra_columns_range;
+            let columns_distribution = Uniform::new_inclusive(lower.max(2), upper.max(2));
+            let num_columns = columns_distribution.sample(&mut rng);
 
-                // 1) Decide how many columns for this table (around AVG_COLUMNS).
-                let lower = if AVG_COLUMNS > EXTRA_COLUMNS_RANGE {
-                    AVG_COLUMNS - EXTRA_COLUMNS_RANGE
-                } else {
-                    2 // ensure at least 2
-                };
-                let upper = AVG_COLUMNS + EXTRA_COLUMNS_RANGE;
-                let columns_distribution = Uniform::new_inclusive(lower.max(2), upper.max(2));
-                let num_columns = columns_distribution.sample(&mut rng);
+            // 1.5) Create the mandatory "id" PRIMARY KEY column
+            let id_column = Column {
+                name: "id".to_string(),
+                is_not_null: true,
+                is_unique: false,
+                is_primary_key: true,
+                is_foreign_key: false,
+                reference: None,
+            };
+            table.columns.push(id_column.clone());
+            reference_candidates.push((table_name.clone(), "id".to_string()));
 
-                // 1.5) Create the mandatory "id" PRIMARY KEY column
-                let id_column = Column {
-                    name: "id".to_string(),
-                    is_not_null: true,
+            // Create the remaining columns
+            let mut regular_columns = Vec::new();
+            for _ in 1..=num_columns {
+                let column_name = get_next_column_name();
+                let mut col = Column {
+                    name: column_name,
+                    is_not_null: false,
                     is_unique: false,
-                    is_primary_key: true,
+                    is_primary_key: false,
                     is_foreign_key: false,
                     reference: None,
                 };
-                table.columns.push(id_column.clone());
-                reference_candidates.push((table_name.clone(), "id".to_string()));
+                // Possibly make it UNIQUE
+                if rng.gen_bool(args.additional_unique_prob) {
+                    col.is_unique = true;
+                    col.is_not_null = rng.gen_bool(args.additional_unique_not_null_prob);
+                }
+                regular_columns.push(col);
+            }
 
-                // 2) Create the "main key" column (now just a regular unique column).
-                let main_key_col_name = get_next_column_name();
-                let is_unique = rng.gen_bool(MAIN_KEY_PK_PROB);
-                let is_not_null = if is_unique {
-                    rng.gen_bool(MAIN_KEY_UNIQUE_NOT_NULL_PROB)
+            // 4) Determine how many foreign key columns to add
+            let foreign_key_max_count = ((i - 1) as f64 * (args.foreign_key_max_percent as f64 / 100.0)).floor() as usize;
+            let min_fk_columns = if i == 1 { 0 } else { 1 }; // At least 1 FK for non-first tables
+            let possible_fk_columns = foreign_key_max_count
+                .min(regular_columns.len())
+                .min(reference_candidates.len())
+                .max(min_fk_columns);
+            let fk_distribution = Uniform::new_inclusive(min_fk_columns, possible_fk_columns);
+            let num_fk_columns = fk_distribution.sample(&mut rng);
+
+            // Shuffle, then convert a subset to foreign keys
+            regular_columns.shuffle(&mut rng);
+            let (fk_cols, normal_cols) = regular_columns.split_at_mut(num_fk_columns);
+            for fk_col in fk_cols.iter_mut() {
+                fk_col.is_foreign_key = true;
+
+                // Pick a random reference target
+                let idx = rng.gen_range(0..reference_candidates.len());
+                let (ref_table, ref_column) = &reference_candidates[idx];
+
+                // If the foreign key references its own table, it must be nullable
+                if ref_table == &table_name {
+                    fk_col.is_not_null = false;
                 } else {
-                    false
-                };
-                let main_key_column = Column {
-                    name: main_key_col_name,
-                    is_not_null,
-                    is_unique,
-                    is_primary_key: false,  // Never primary key now
-                    is_foreign_key: false,
-                    reference: None,
-                };
-                table.columns.push(main_key_column);
-
-                // 3) Create the remaining columns (num_columns - 1).
-                let mut regular_columns = Vec::new();
-                for _ in 2..=num_columns {
-                    let column_name = get_next_column_name();
-                    let mut col = Column {
-                        name: column_name,
-                        is_not_null: false,
-                        is_unique: false,
-                        is_primary_key: false,
-                        is_foreign_key: false,
-                        reference: None,
-                    };
-                    // Possibly make it UNIQUE
-                    if rng.gen_bool(ADDITIONAL_UNIQUE_PROB) {
-                        col.is_unique = true;
-                        col.is_not_null = rng.gen_bool(ADDITIONAL_UNIQUE_NOT_NULL_PROB);
-                    }
-                    regular_columns.push(col);
+                    fk_col.is_not_null = rng.gen_bool(args.foreign_key_not_null_prob);
                 }
 
-                // 4) Determine how many foreign key columns to add.
-                // At least 1 foreign key for all tables except the first one.
-                let foreign_key_max_count = ((i - 1) as f64 * (FOREIGN_KEY_MAX_PERCENT as f64 / 100.0)).floor() as usize;
-                let min_fk_columns = if i == 1 { 0 } else { 1 }; // At least 1 FK for non-first tables
-                let possible_fk_columns = foreign_key_max_count
-                    .min(regular_columns.len())
-                    .min(reference_candidates.len())
-                    .max(min_fk_columns); // Ensure we have at least min_fk_columns
-                let fk_distribution = Uniform::new_inclusive(min_fk_columns, possible_fk_columns);
-                let num_fk_columns = fk_distribution.sample(&mut rng);
+                fk_col.is_unique = rng.gen_bool(args.foreign_key_unique_prob);
+                fk_col.reference = Some((ref_table.clone(), ref_column.clone()));
+            }
 
-                // Shuffle, then convert a subset to foreign keys
-                regular_columns.shuffle(&mut rng);
-                let (fk_cols, normal_cols) = regular_columns.split_at_mut(num_fk_columns);
-                for fk_col in fk_cols.iter_mut() {
-                    fk_col.is_foreign_key = true;
-                    fk_col.is_not_null = rng.gen_bool(FOREIGN_KEY_NOT_NULL_PROB);
-                    fk_col.is_unique = rng.gen_bool(FOREIGN_KEY_UNIQUE_PROB);
+            // Combine all columns and sort them by name
+            let mut final_columns = Vec::new();
+            let main_key_col = table.columns.remove(0);
+            final_columns.push(main_key_col);
+            final_columns.extend_from_slice(fk_cols);
+            final_columns.extend_from_slice(normal_cols);
 
-                    // Pick a random reference target
-                    let idx = rng.gen_range(0..reference_candidates.len());
-                    let (ref_table, ref_column) = &reference_candidates[idx];
-                    fk_col.reference = Some((ref_table.clone(), ref_column.clone()));
+            // Sort columns by extracting the number from the column name and comparing
+            final_columns.sort_by_key(|col| {
+                col.name
+                    .trim_start_matches('c')
+                    .parse::<usize>()
+                    .unwrap_or(0)
+            });
+
+            table.columns = final_columns;
+            tables.push(table);
+
+            // 5) Update reference_candidates for future foreign keys
+            let last_table = tables.last().unwrap();
+            for col in &last_table.columns {
+                if col.is_primary_key || col.is_unique {
+                    reference_candidates.push((last_table.name.clone(), col.name.clone()));
                 }
+            }
+        }
 
-                // Combine all columns and sort them by name
-                let mut final_columns = Vec::new();
-                let main_key_col = table.columns.remove(0);
-                final_columns.push(main_key_col);
-                final_columns.extend_from_slice(fk_cols);
-                final_columns.extend_from_slice(normal_cols);
+        // 6) Generate CREATE TABLE statements
+        for table in &tables {
+            let mut create_stmt = format!("CREATE TABLE {} (\n", table.name);
 
-                // Sort columns by extracting the number from the column name and comparing
-                final_columns.sort_by_key(|col| {
-                    col.name
-                        .trim_start_matches('c')
-                        .parse::<usize>()
-                        .unwrap_or(0)
-                });
-
-                table.columns = final_columns;
-                tables.push(table);
-
-                // 5) Update reference_candidates for future foreign keys
-                let last_table = tables.last().unwrap();
-                for col in &last_table.columns {
-                    if col.is_primary_key || col.is_unique {
-                        reference_candidates.push((last_table.name.clone(), col.name.clone()));
-                    }
+            // Collect constraints first
+            let mut constraints = Vec::new();
+            for column in &table.columns {
+                if column.is_primary_key {
+                    constraints.push(format!(
+                        "CONSTRAINT {table}_{col}_pk PRIMARY KEY ({col})",
+                        table = table.name,
+                        col = column.name
+                    ));
+                } else if column.is_unique {
+                    constraints.push(format!(
+                        "CONSTRAINT {table}_{col}_unique UNIQUE ({col})",
+                        table = table.name,
+                        col = column.name
+                    ));
+                }
+                if column.is_foreign_key {
+                    let (ref_table, ref_col) = column.reference.clone().unwrap();
+                    constraints.push(format!(
+                        "CONSTRAINT {table}_{col}_fk FOREIGN KEY ({col}) REFERENCES {ref_table} ({ref_col})",
+                        table = table.name,
+                        col = column.name,
+                        ref_table = ref_table,
+                        ref_col = ref_col
+                    ));
                 }
             }
 
-            // 6) Generate and print CREATE TABLE statements
-            for table in &tables {
-                let mut create_stmt = format!("CREATE TABLE {} (\n", table.name);
+            let total_items = table.columns.len() + constraints.len();
+            let mut items_printed = 0;
 
-                // Collect constraints first
-                let mut constraints = Vec::new();
-                for column in &table.columns {
-                    if column.is_primary_key {
-                        constraints.push(format!(
-                            "CONSTRAINT {table}_{col}_pk PRIMARY KEY ({col})",
-                            table = table.name,
-                            col = column.name
-                        ));
-                    } else if column.is_unique {
-                        constraints.push(format!(
-                            "CONSTRAINT {table}_{col}_unique UNIQUE ({col})",
-                            table = table.name,
-                            col = column.name
-                        ));
-                    }
-                    if column.is_foreign_key {
-                        let (ref_table, ref_col) = column.reference.clone().unwrap();
-                        constraints.push(format!(
-                            "CONSTRAINT {table}_{col}_fk FOREIGN KEY ({col}) REFERENCES {ref_table} ({ref_col})",
-                            table = table.name,
-                            col = column.name,
-                            ref_table = ref_table,
-                            ref_col = ref_col
-                        ));
-                    }
+            // Add columns
+            for column in &table.columns {
+                items_printed += 1;
+                let mut col_def = format!("    {}", column.name);
+                col_def.push_str(" INT");
+                if column.is_not_null {
+                    col_def.push_str(" NOT NULL");
                 }
-
-                let total_items = table.columns.len() + constraints.len();
-                let mut items_printed = 0;
-
-                // Add columns
-                for column in &table.columns {
-                    items_printed += 1;
-                    let mut col_def = format!("    {}", column.name);
-                    col_def.push_str(" INT");
-                    if column.is_not_null {
-                        col_def.push_str(" NOT NULL");
-                    }
-                    if items_printed < total_items {
-                        col_def.push_str(",");
-                    }
-                    create_stmt.push_str(&col_def);
-                    create_stmt.push_str("\n");
+                if items_printed < total_items {
+                    col_def.push_str(",");
                 }
-
-                // Add constraints
-                for constraint in constraints.iter() {
-                    items_printed += 1;
-                    if items_printed == total_items {
-                        create_stmt.push_str(&format!("    {}", constraint));
-                    } else {
-                        create_stmt.push_str(&format!("    {},\n", constraint));
-                    }
-                }
-
-                create_stmt.push_str("\n);");
-                output.push(create_stmt);
+                create_stmt.push_str(&col_def);
+                create_stmt.push_str("\n");
             }
 
-            // Try to generate insert statements
-            match generate_insert_statements(&tables, &mut rng, &mut output) {
-                Ok(_) => {
-                    if let Some((first_table, joins)) = generate_fk_join_query(&tables, 5, &mut rng) {
-                        // Track tables in order of appearance, using their aliases
-                        let mut table_aliases = Vec::new();
-                        table_aliases.push((first_table.clone(), first_table.clone()));
+            // Add constraints
+            for constraint in constraints.iter() {
+                items_printed += 1;
+                if items_printed == total_items {
+                    create_stmt.push_str(&format!("    {}", constraint));
+                } else {
+                    create_stmt.push_str(&format!("    {},\n", constraint));
+                }
+            }
 
-                        for join in &joins {
-                            table_aliases.push((join.new_table.clone(), join.new_alias.clone()));
+            create_stmt.push_str("\n);");
+            output.push(create_stmt);
+        }
+
+        // Generate insert statements
+        if let Ok(_) = generate_insert_statements(&tables, &mut rng, &mut output, &args) {
+            if let Some((first_table, joins)) = generate_fk_join_query(&tables, 5, &mut rng, &args) {
+                // Track tables in order of appearance, using their aliases
+                let mut table_aliases = Vec::new();
+                table_aliases.push((first_table.clone(), first_table.clone()));
+
+                for join in &joins {
+                    table_aliases.push((join.new_table.clone(), join.new_alias.clone()));
+                }
+
+                // Create view and verification queries
+                let view_sql = create_view_sql(&first_table, &joins, &table_aliases);
+                let verify_sql = create_verify_sql(&table_aliases);
+
+                // Get theoretical results
+                let (theoretical_a, theoretical_u) = verify_derived_table(&first_table, &joins);
+
+                // Connect to PostgreSQL and execute
+                let db_user = args.db_user.clone().unwrap_or_else(|| env::var("USER").unwrap_or_else(|_| "postgres".to_string()));
+                let conn_string = format!(
+                    "host='{}' port='{}' dbname='{}' user='{}' password='{}'",
+                    args.db_host.replace("'", "\\'"),
+                    args.db_port,
+                    args.db_name.replace("'", "\\'"),
+                    db_user.replace("'", "\\'"),
+                    args.db_password.replace("'", "\\'")
+                );
+
+                match Client::connect(&conn_string, NoTls) {
+                    Ok(mut client) => {
+                        // Execute schema reset and SQL statements
+                        if let Err(e) = client.batch_execute(&format!("DROP SCHEMA IF EXISTS {} CASCADE; CREATE SCHEMA {}; SET search_path TO {};", args.db_name, args.db_name, args.db_name)) {
+                            eprintln!("\nError: Failed to reset database schema");
+                            eprintln!("Details: {}", e);
+                            eprintln!("\nPlease check:");
+                            eprintln!("1. Is PostgreSQL running?");
+                            eprintln!("2. Can you connect to {}:{} ?", args.db_host, args.db_port);
+                            eprintln!("3. Does user '{}' have permission to create schemas?", db_user);
+                            save_error_sql(&output, &e);
+                            std::process::exit(1);
                         }
 
-                        // Create view and verification queries
-                        let view_sql = create_view_sql(&first_table, &joins, &table_aliases);
-                        let verify_sql = create_verify_sql(&table_aliases);
+                        // Execute statements and handle errors
+                        for sql in &output {
+                            if let Err(e) = client.batch_execute(sql) {
+                                save_error_sql(&output, &e);
+                                std::process::exit(1);
+                            }
+                        }
 
-                        // Get theoretical results
-                        let (theoretical_a, theoretical_u) = verify_derived_table(&first_table, &joins);
+                        // Execute view creation
+                        if let Err(e) = client.batch_execute(&view_sql) {
+                            save_error_sql(&output, &e);
+                            std::process::exit(1);
+                        }
 
-                        // Connect to PostgreSQL and execute
-                        let user = env::var("USER").unwrap_or_else(|_| "postgres".to_string());
-                        let conn_string = format!(
-                            "host=localhost port=5432 dbname=fkjoinstest user={} password=''",
-                            user
-                        );
+                        // Execute verification query
+                        match client.query_one(&verify_sql, &[]) {
+                            Ok(row) => {
+                                let practical_a: Vec<String> = row.get(0);
+                                let practical_u: Vec<String> = row.get(1);
 
-                        match Client::connect(&conn_string, NoTls) {
-                            Ok(mut client) => {
-                                // Execute schema reset and SQL statements
-                                if let Err(e) = client.batch_execute("DROP SCHEMA IF EXISTS fkjoinstest CASCADE; CREATE SCHEMA fkjoinstest; SET search_path TO fkjoinstest;") {
-                                    save_error_sql(&output, &e);
+                                let practical_a_set: std::collections::HashSet<_> =
+                                    practical_a.into_iter().collect();
+                                let practical_u_set: std::collections::HashSet<_> =
+                                    practical_u.into_iter().collect();
+
+                                // Sort the elements for easier comparison
+                                let mut theoretical_a_vec: Vec<_> = theoretical_a.iter().collect();
+                                let mut theoretical_u_vec: Vec<_> = theoretical_u.iter().collect();
+                                let mut practical_a_vec: Vec<_> = practical_a_set.iter().collect();
+                                let mut practical_u_vec: Vec<_> = practical_u_set.iter().collect();
+
+                                theoretical_a_vec.sort();
+                                theoretical_u_vec.sort();
+                                practical_a_vec.sort();
+                                practical_u_vec.sort();
+
+                                // Print results with sorted elements
+                                println!("Results:");
+                                println!("Theoretical A: {:?}", theoretical_a_vec);
+                                println!("Practical A:   {:?}", practical_a_vec);
+                                println!("Theoretical U: {:?}", theoretical_u_vec);
+                                println!("Practical U:   {:?}", practical_u_vec);
+
+                                // Check for errors
+                                let mut error_msg = String::new();
+
+                                if !theoretical_a.is_subset(&practical_a_set) {
+                                    error_msg.push_str(&format!(
+                                        "Theoretical A is not a subset of practical A\n\
+                                        Extra in theoretical A: {:?}\n",
+                                        theoretical_a.difference(&practical_a_set).collect::<Vec<_>>()
+                                    ));
+                                }
+                                if !theoretical_u.is_subset(&practical_u_set) {
+                                    error_msg.push_str(&format!(
+                                        "Theoretical U is not a subset of practical U\n\
+                                        Extra in theoretical U: {:?}\n",
+                                        theoretical_u.difference(&practical_u_set).collect::<Vec<_>>()
+                                    ));
+                                }
+
+                                if !error_msg.is_empty() {
+                                    save_error_sql(&output, &error_msg);
                                     std::process::exit(1);
                                 }
 
-                                // Execute statements and handle errors
+                                // Generate filename based on A and U set sizes
+                                let filename = format!("joins_{}A_{}U.sql", theoretical_a.len(), theoretical_u.len());
+
+                                // Check if this case already exists
+                                if std::path::Path::new(&filename).exists() {
+                                    println!("Case with {} elements in A and {} elements in U already exists, skipping...",
+                                        theoretical_a.len(), theoretical_u.len());
+                                    continue; // Continue the main loop instead of breaking
+                                }
+
+                                // Log successful new case
+                                let mut log = std::fs::File::create(&filename)
+                                    .expect("Failed to create log file");
+
+                                writeln!(log, "-- New case with {} elements in A and {} elements in U",
+                                    theoretical_a.len(), theoretical_u.len()).expect("Failed to write to log");
+                                writeln!(log, "-- Results:").expect("Failed to write to log");
+                                writeln!(log, "-- Theoretical A: {:?}", theoretical_a_vec).expect("Failed to write to log");
+                                writeln!(log, "-- Practical A:   {:?}", practical_a_vec).expect("Failed to write to log");
+                                writeln!(log, "-- Theoretical U: {:?}", theoretical_u_vec).expect("Failed to write to log");
+                                writeln!(log, "-- Practical U:   {:?}", practical_u_vec).expect("Failed to write to log");
+                                writeln!(log).expect("Failed to write to log");
+
+                                // Write all SQL statements
                                 for sql in &output {
-                                    if let Err(e) = client.batch_execute(sql) {
-                                        save_error_sql(&output, &e);
-                                        std::process::exit(1);
-                                    }
+                                    writeln!(log, "{}", sql).expect("Failed to write to log");
                                 }
+                                writeln!(log, "\n\n").expect("Failed to write to log");  // Add extra newline before view
+                                writeln!(log, "{}", view_sql).expect("Failed to write to log");
+                                writeln!(log, "\n\n").expect("Failed to write to log");  // Add extra newline before verification
+                                writeln!(log, "{}", verify_sql).expect("Failed to write to log");
+                                writeln!(log, "\n").expect("Failed to write to log");
 
-                                // Execute view creation
-                                if let Err(e) = client.batch_execute(&view_sql) {
-                                    save_error_sql(&output, &e);
-                                    std::process::exit(1);
-                                }
-
-                                // Execute verification query
-                                match client.query_one(&verify_sql, &[]) {
-                                    Ok(row) => {
-                                        let practical_a: Vec<String> = row.get(0);
-                                        let practical_u: Vec<String> = row.get(1);
-
-                                        let practical_a_set: std::collections::HashSet<_> =
-                                            practical_a.into_iter().collect();
-                                        let practical_u_set: std::collections::HashSet<_> =
-                                            practical_u.into_iter().collect();
-
-                                        // Only print results
-                                        println!("Results:");
-                                        println!("Theoretical A: {:?}", theoretical_a);
-                                        println!("Practical A:   {:?}", practical_a_set);
-                                        println!("Theoretical U: {:?}", theoretical_u);
-                                        println!("Practical U:   {:?}", practical_u_set);
-
-                                        // Check for errors
-                                        let mut error_msg = String::new();
-
-                                        if !theoretical_a.is_subset(&practical_a_set) {
-                                            error_msg.push_str(&format!(
-                                                "Theoretical A is not a subset of practical A\n\
-                                                Extra in theoretical A: {:?}\n",
-                                                theoretical_a.difference(&practical_a_set).collect::<Vec<_>>()
-                                            ));
-                                        }
-                                        if !theoretical_u.is_subset(&practical_u_set) {
-                                            error_msg.push_str(&format!(
-                                                "Theoretical U is not a subset of practical U\n\
-                                                Extra in theoretical U: {:?}\n",
-                                                theoretical_u.difference(&practical_u_set).collect::<Vec<_>>()
-                                            ));
-                                        }
-
-                                        if !error_msg.is_empty() {
-                                            save_error_sql(&output, &error_msg);
-                                            std::process::exit(1);
-                                        }
-
-                                        // Generate filename based on A and U set sizes
-                                        let filename = format!("joins_{}A_{}U.sql", theoretical_a.len(), theoretical_u.len());
-
-                                        // Check if this case already exists
-                                        if std::path::Path::new(&filename).exists() {
-                                            println!("Case with {} elements in A and {} elements in U already exists, skipping...",
-                                                theoretical_a.len(), theoretical_u.len());
-                                            break 'attempt;
-                                        }
-
-                                        // Log successful new case
-                                        let mut log = std::fs::File::create(&filename)
-                                            .expect("Failed to create log file");
-
-                                        writeln!(log, "-- New case with {} elements in A and {} elements in U",
-                                            theoretical_a.len(), theoretical_u.len()).expect("Failed to write to log");
-                                        writeln!(log, "-- Results:").expect("Failed to write to log");
-                                        writeln!(log, "-- Theoretical A: {:?}", theoretical_a).expect("Failed to write to log");
-                                        writeln!(log, "-- Practical A:   {:?}", practical_a_set).expect("Failed to write to log");
-                                        writeln!(log, "-- Theoretical U: {:?}", theoretical_u).expect("Failed to write to log");
-                                        writeln!(log, "-- Practical U:   {:?}", practical_u_set).expect("Failed to write to log");
-                                        writeln!(log).expect("Failed to write to log");
-
-                                        // Write all SQL statements
-                                        for sql in &output {
-                                            writeln!(log, "{}", sql).expect("Failed to write to log");
-                                        }
-                                        writeln!(log, "\n\n").expect("Failed to write to log");  // Add extra newline before view
-                                        writeln!(log, "{}", view_sql).expect("Failed to write to log");
-                                        writeln!(log, "\n\n").expect("Failed to write to log");  // Add extra newline before verification
-                                        writeln!(log, "{}", verify_sql).expect("Failed to write to log");
-                                        writeln!(log, "\n").expect("Failed to write to log");
-
-                                        println!("Found new case! Saved to {}", filename);
-                                    }
-                                    Err(e) => {
-                                        save_error_sql(&output, &e);
-                                        std::process::exit(1);
-                                    }
-                                }
-                                break 'attempt;
+                                println!("Found new case! Saved to {}", filename);
                             }
                             Err(e) => {
                                 save_error_sql(&output, &e);
@@ -898,11 +939,20 @@ fn main() {
                             }
                         }
                     }
-                }
-                Err(e) => {
-                    println!("-- {} - Retrying...", e);
-                    attempt += 1;
-                    continue;
+                    Err(e) => {
+                        eprintln!("\nError: Failed to connect to database");
+                        eprintln!("Details: {}", e);
+                        eprintln!("\nPlease check:");
+                        eprintln!("1. Is PostgreSQL running?");
+                        eprintln!("2. Can you connect to {}:{} ?", args.db_host, args.db_port);
+                        eprintln!("3. Are the database credentials correct?");
+                        eprintln!("   - Database: {}", args.db_name);
+                        eprintln!("   - User: {}", db_user);
+                        eprintln!("   - Host: {}", args.db_host);
+                        eprintln!("   - Port: {}", args.db_port);
+                        save_error_sql(&output, &e);
+                        std::process::exit(1);
+                    }
                 }
             }
         }

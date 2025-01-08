@@ -155,10 +155,61 @@ The tool's behavior can be customized through constants in `src/main.rs`:
 
 ## Usage
 
-Run the tool with:
+Run the tool with default settings:
 
 ```bash
+createdb joinfuzzer
 cargo run
+```
+
+Or specify custom parameters:
+
+```bash
+sql-join-fuzzer --num-tables 10 --avg-columns 8 --max-rows-per-table 500
+```
+
+### Command Line Options
+
+```
+Options:
+      --num-tables <NUM_TABLES>
+          Number of tables to generate [default: 5]
+      --avg-columns <AVG_COLUMNS>
+          Average number of columns per table [default: 10]
+      --extra-columns-range <EXTRA_COLUMNS_RANGE>
+          +/- range around the average number of columns [default: 3]
+      --additional-unique-prob <ADDITIONAL_UNIQUE_PROB>
+          Probability that any additional column is UNIQUE [default: 0.3]
+      --additional-unique-not-null-prob <ADDITIONAL_UNIQUE_NOT_NULL_PROB>
+          Probability that a UNIQUE column is NOT NULL [default: 0.5]
+      --foreign-key-not-null-prob <FOREIGN_KEY_NOT_NULL_PROB>
+          Probability that a foreign key column is NOT NULL [default: 0.5]
+      --foreign-key-unique-prob <FOREIGN_KEY_UNIQUE_PROB>
+          Probability that a foreign key column is UNIQUE [default: 0.1]
+      --foreign-key-max-percent <FOREIGN_KEY_MAX_PERCENT>
+          Maximum percentage of foreign key columns relative to previous tables [default: 50]
+      --max-rows-per-table <MAX_ROWS_PER_TABLE>
+          Maximum number of rows per table [default: 1000]
+      --foreign-key-reuse-prob <FOREIGN_KEY_REUSE_PROB>
+          Probability of reusing an existing foreign key value [default: 0.5]
+      --table-reuse-prob <TABLE_REUSE_PROB>
+          Probability of reusing a table with a new alias [default: 0.1]
+      --foreign-key-null-prob <FOREIGN_KEY_NULL_PROB>
+          Probability of NULL for nullable foreign key columns [default: 0.2]
+      --db-host <DB_HOST>
+          Database host [default: localhost]
+      --db-port <DB_PORT>
+          Database port [default: 5432]
+      --db-name <DB_NAME>
+          Database name [default: joinfuzzer]
+      --db-user <DB_USER>
+          Database user
+      --db-password <DB_PASSWORD>
+          Database password [default: ]
+  -h, --help
+          Print help
+  -V, --version
+          Print version
 ```
 
 The tool will:
