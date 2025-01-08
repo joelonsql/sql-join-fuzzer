@@ -835,8 +835,8 @@ fn main() {
                 if !first_output {
                     print!("\x1B[3F\x1B[0J");
                 }
-                println!("A: {}", format!("{{{}}}", theoretical_a.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
-                println!("U: {}", format!("{{{}}}", theoretical_u.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+                println!("A: {}", format!("{{{}}}", theoretical_a.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")));
+                println!("U: {}", format!("{{{}}}", theoretical_u.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")));
                 println!("");  // Extra line for status messages
                 first_output = false;
 
@@ -894,17 +894,32 @@ fn main() {
                         // Execute verification query (now without setting timeout again)
                         match client.query_one(&verify_sql, &[]) {
                             Ok(row) => {
-                                let practical_a: Vec<String> = row.get(0);
-                                let practical_u: Vec<String> = row.get(1);
+                                // Get comma-separated strings from query
+                                let practical_a_str: Option<String> = row.get(0);
+                                let practical_u_str: Option<String> = row.get(1);
 
-                                let practical_a_set: std::collections::HashSet<_> = practical_a.into_iter().collect();
-                                let practical_u_set: std::collections::HashSet<_> = practical_u.into_iter().collect();
+                                // Convert to HashSets using as_ref() to borrow instead of move
+                                let practical_a_set: std::collections::HashSet<String> = practical_a_str
+                                    .as_ref()
+                                    .map(|s| s.split(',').map(String::from).collect())
+                                    .unwrap_or_default();
+                                let practical_u_set: std::collections::HashSet<String> = practical_u_str
+                                    .as_ref()
+                                    .map(|s| s.split(',').map(String::from).collect())
+                                    .unwrap_or_default();
 
                                 // Create sorted string representations
-                                let theoretical_a_str = format!("{{{}}}", theoretical_a.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
-                                let theoretical_u_str = format!("{{{}}}", theoretical_u.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
-                                let practical_a_str = format!("{{{}}}", practical_a_set.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
-                                let practical_u_str = format!("{{{}}}", practical_u_set.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+                                let mut theoretical_a_vec: Vec<_> = theoretical_a.iter().collect();
+                                let mut theoretical_u_vec: Vec<_> = theoretical_u.iter().collect();
+                                theoretical_a_vec.sort();
+                                theoretical_u_vec.sort();
+
+                                let theoretical_a_str = format!("{{{}}}", theoretical_a_vec.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(","));
+                                let theoretical_u_str = format!("{{{}}}", theoretical_u_vec.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(","));
+
+                                // For practical sets, we can use the strings directly from the query since they're already sorted
+                                let practical_a_str = format!("{{{}}}", practical_a_str.unwrap_or_default());
+                                let practical_u_str = format!("{{{}}}", practical_u_str.unwrap_or_default());
 
                                 // Print results
                                 print!("\x1B[3F\x1B[0J");  // Move up 3 lines and clear them
@@ -1083,31 +1098,29 @@ fn create_view_sql(first_table: &str, joins: &[JoinInfo], table_aliases: &[(Stri
 }
 
 fn create_verify_sql(table_aliases: &[(String, String)]) -> String {
-    let mut sql = String::from("-- This query computes two properties of the derived table:\n");
-    sql.push_str("-- 1. Set A: Contains table aliases where ALL rows from the base table appear in the derived table\n");
-    sql.push_str("--    For each table T, checks if there exists any row in T that's NOT in the derived table\n");
-    sql.push_str("--    If no such row exists, T is added to set A\n");
-    sql.push_str("-- 2. Set U: Contains table aliases where rows appear at most once in the derived table\n");
-    sql.push_str("--    For each table T, checks if the count of its IDs equals the count of distinct IDs\n");
-    sql.push_str("--    If equal, T is added to set U\n");
-    sql.push_str("SELECT\n    ARRAY[]::text[]\n");
+    let mut sql = String::new();
+    sql.push_str("WITH A_tables AS (\n");
 
-    // Generate A verification
-    for (table, alias) in table_aliases {
-        sql.push_str(&format!("    || CASE WHEN\n"));
-        sql.push_str(&format!("    NOT EXISTS (SELECT 1 FROM {} WHERE NOT EXISTS (SELECT 1 FROM v WHERE v.{}_id = {}.id))\n",
-            table, alias, table));
-        sql.push_str(&format!("    THEN ARRAY['{}'] END\n", alias));
-    }
-    sql.push_str("    AS \"A\",\n");
+    // Generate A verification using UNION ALL
+    let a_checks: Vec<_> = table_aliases.iter().map(|(table, alias)| {
+        format!("    SELECT \n        CASE WHEN NOT EXISTS (SELECT 1 FROM {} WHERE NOT EXISTS (SELECT 1 FROM v WHERE v.{}_id = {}.id))\n        THEN '{}' END AS table_name",
+            table, alias, table, alias)
+    }).collect();
+    sql.push_str(&a_checks.join("\n    UNION ALL\n"));
 
-    // Generate U verification
-    sql.push_str("    ARRAY[]::text[]\n");
-    for (_, alias) in table_aliases {
-        sql.push_str(&format!("    || CASE WHEN\n"));
-        sql.push_str(&format!("    (SELECT COUNT({0}_id) = COUNT(DISTINCT {0}_id) FROM v)\n", alias));
-        sql.push_str(&format!("    THEN ARRAY['{}'] END\n", alias));
-    }
-    sql.push_str("    AS \"U\";");
+    sql.push_str("\n),\nU_tables AS (\n");
+
+    // Generate U verification using UNION ALL
+    let u_checks: Vec<_> = table_aliases.iter().map(|(_, alias)| {
+        format!("    SELECT\n        CASE WHEN (SELECT COUNT({0}_id) = COUNT(DISTINCT {0}_id) FROM v)\n        THEN '{0}' END AS table_name",
+            alias)
+    }).collect();
+    sql.push_str(&u_checks.join("\n    UNION ALL\n"));
+
+    sql.push_str("\n)\nSELECT \n");
+    sql.push_str("    string_agg(table_name, ',' ORDER BY table_name) AS \"A\",\n");
+    sql.push_str("    (SELECT string_agg(table_name, ',' ORDER BY table_name) FROM U_tables WHERE table_name IS NOT NULL) AS \"U\"\n");
+    sql.push_str("FROM A_tables \nWHERE table_name IS NOT NULL;");
+
     sql
 }
