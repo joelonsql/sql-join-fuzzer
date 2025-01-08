@@ -15,6 +15,84 @@ The algorithm processes each join operation sequentially, updating these sets ba
 - Foreign key direction (→ or ←)
 - Column constraints (NOT NULL, UNIQUE)
 
+## Algorithm
+
+The core algorithm for verifying properties of foreign key joins is as follows:
+
+```python
+def verify_derived_table(query):
+    if not query:
+        return set(), set()
+
+    # The first item is a relation name (not a join tuple) and
+    # begins in both sets since it has not joined with anything yet.
+    A = { query[0] }
+    U = { query[0] }
+
+    # Subsequent elements are 6-tuples containing join metadata.
+    for (join_type, fk_dir, fk_cols_not_null, fk_cols_unique, fk_rel, pk_rel) in query[1:]:
+        match fk_dir:
+            case "<-":
+                existing_rel, new_rel = pk_rel, fk_rel
+            case "->":
+                existing_rel, new_rel = fk_rel, pk_rel
+
+        cond = (existing_rel in A and fk_cols_not_null)
+        match (join_type, fk_dir, cond):
+            case ("LEFT", "<-", _):
+                pass
+            case ("LEFT", "->", False):
+                pass
+            case ("LEFT", "->", True):
+                A = A | { new_rel }
+            case ("FULL", _, _):
+                A = A | { new_rel }
+            case ("INNER", _, False):
+                A = set()
+            case ("INNER", "<-", True):
+                A = { existing_rel }
+            case ("INNER", "->", True):
+                A = { new_rel }
+            case ("RIGHT", "<-", False):
+                A = { new_rel }
+            case ("RIGHT", "<-", True):
+                A = { existing_rel, new_rel }
+            case ("RIGHT", "->", _):
+                A = { new_rel }
+        
+        if (existing_rel in U) and fk_cols_unique:
+            U = U | { new_rel }
+        elif (existing_rel not in U) and fk_cols_unique:
+            pass
+        elif (fk_dir == "<-") and not ((existing_rel in U) and fk_cols_unique):
+            pass
+        elif (fk_dir == "->") and (existing_rel not in U) and (not fk_cols_unique):
+            U = set()
+        elif (fk_dir == "->") and (existing_rel in U) and (not fk_cols_unique):
+            U = { new_rel }
+        
+    return A, U
+```
+
+The algorithm takes a query representation consisting of:
+1. The first relation (table) in the query
+2. A sequence of joins, each containing:
+   - Join type (INNER, LEFT, RIGHT, FULL)
+   - Foreign key direction (← or →)
+   - Whether foreign key columns are NOT NULL
+   - Whether foreign key columns are UNIQUE
+   - The foreign key relation
+   - The primary key relation
+
+It maintains two sets:
+- Set A: Relations whose rows are all preserved in the result
+- Set U: Relations whose rows appear at most once in the result
+
+For each join, it updates these sets based on:
+1. The join type and direction
+2. The NOT NULL and UNIQUE constraints on the foreign key columns
+3. Whether the existing relation is in sets A and U
+
 ## Experimental Validation
 
 The tool serves as an experimental validator for the theoretical algorithm by:
