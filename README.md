@@ -24,8 +24,8 @@ def verify_derived_table(query):
     if not query:
         return set(), set()
 
-    # The first item is a relation name (not a join tuple) and
-    # begins in both sets since it has not joined with anything yet.
+    # The first item is a relation name (not a join tuple). It
+    # belongs in both sets initially since it hasn't been joined yet.
     A = { query[0] }
     U = { query[0] }
 
@@ -37,8 +37,7 @@ def verify_derived_table(query):
             case "->":
                 existing_rel, new_rel = fk_rel, pk_rel
 
-        cond = (existing_rel in A and fk_cols_not_null)
-        match (join_type, fk_dir, cond):
+        match (join_type, fk_dir, existing_rel in A and fk_cols_not_null):
             case ("LEFT", "<-", _):
                 pass
             case ("LEFT", "->", False):
@@ -57,20 +56,19 @@ def verify_derived_table(query):
                 A = { new_rel }
             case ("RIGHT", "<-", True):
                 A = { existing_rel, new_rel }
-            case ("RIGHT", "->", _):
-                A = { new_rel }
-        
-        if (existing_rel in U) and fk_cols_unique:
-            U = U | { new_rel }
-        elif (existing_rel not in U) and fk_cols_unique:
-            pass
-        elif (fk_dir == "<-") and not ((existing_rel in U) and fk_cols_unique):
-            pass
-        elif (fk_dir == "->") and (existing_rel not in U) and (not fk_cols_unique):
-            U = set()
-        elif (fk_dir == "->") and (existing_rel in U) and (not fk_cols_unique):
-            U = { new_rel }
-        
+
+        match (fk_dir, existing_rel in U, fk_cols_unique):
+            case (_, True, True):
+                U = U | { new_rel }
+            case (_, False, True):
+                pass
+            case ("<-", False, _) | ("<-", _, False):
+                pass
+            case ("->", False, False):
+                U = set()
+            case ("->", True, False):
+                U = { new_rel }
+
     return A, U
 ```
 
