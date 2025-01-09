@@ -894,6 +894,20 @@ fn run_fuzzer(args: &Args) -> Result<(), Box<dyn Error>> {
                 let view_sql = create_view_sql(&first_table, &joins, &table_aliases, &args.join_syntax);
                 let verify_sql = create_verify_sql(&table_aliases);
 
+                // Save current SQL to file for debugging
+                let mut current_sql = File::create("join_fuzzer_current.sql")?;
+                writeln!(current_sql, "-- Generated SQL for debugging purposes")?;
+                writeln!(current_sql, "-- Table creation and data")?;
+                for sql in &output {
+                    writeln!(current_sql, "{}", sql)?;
+                }
+                writeln!(current_sql)?;
+                writeln!(current_sql, "-- View definition")?;
+                writeln!(current_sql, "{}", view_sql)?;
+                writeln!(current_sql)?;
+                writeln!(current_sql, "-- Verification query")?;
+                writeln!(current_sql, "{}", verify_sql)?;
+
                 // Get theoretical results
                 let (theoretical_a, theoretical_u) = verify_derived_table(&first_table, &joins);
 
@@ -975,7 +989,7 @@ fn run_fuzzer(args: &Args) -> Result<(), Box<dyn Error>> {
                                 view_sql: Some(view_sql.clone()),
                             }))),
                         };
-                        println!("Verification query time: {:?}", start.elapsed());
+                        println!("PostgreSQL query execution time: {:?}", start.elapsed());
 
                         // Create SQLite database and execute schema
                         println!("\nExecuting queries against SQLite:");
@@ -1026,9 +1040,6 @@ fn run_fuzzer(args: &Args) -> Result<(), Box<dyn Error>> {
                         println!("View creation time: {:?}", start.elapsed());
 
                         // Get practical results from SQLite
-                        println!("\nVerification query:");
-                        println!("{}", verify_sql);
-
                         let start = Instant::now();
                         let sqlite_practical = {
                             let mut stmt = match sqlite.prepare(&verify_sql) {
