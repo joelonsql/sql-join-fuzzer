@@ -394,12 +394,18 @@ fn verify_derived_table(first_table: &str, joins: &[JoinInfo]) -> (std::collecti
             },
         }
 
-        if u.contains(&existing_alias) && join.fk_cols_unique {
-            u.insert(new_alias.clone());
-        } else if matches!(join.arrow, FKDir::Forward) && !u.contains(&existing_alias) && !join.fk_cols_unique {
-            u.clear();
-        } else if matches!(join.arrow, FKDir::Forward) && u.contains(&existing_alias) && !join.fk_cols_unique {
-            u = std::collections::HashSet::from([new_alias.clone()]);
+        match (join.arrow, u.contains(&existing_alias), join.fk_cols_unique) {
+            (_, true, true) => {
+                u.insert(new_alias.clone());
+            },
+            (_, false, true) => (),
+            (FKDir::Backward, false, _) | (FKDir::Backward, _, false) => (),
+            (FKDir::Forward, false, false) => {
+                u.clear();
+            },
+            (FKDir::Forward, true, false) => {
+                u = std::collections::HashSet::from([new_alias.clone()]);
+            },
         }
     }
 
