@@ -354,12 +354,13 @@ struct TableAlias {
     alias: String,
 }
 
-fn verify_derived_table(first_table: &str, joins: &[JoinInfo]) -> (std::collections::HashSet<String>, std::collections::HashSet<String>) {
+fn verify_derived_table(first_table: &str, joins: &[JoinInfo]) -> (std::collections::HashMap<String, std::collections::HashSet<String>>, std::collections::HashSet<String>) {
     if joins.is_empty() {
-        return (std::collections::HashSet::new(), std::collections::HashSet::new());
+        return (std::collections::HashMap::new(), std::collections::HashSet::new());
     }
 
-    let mut a = std::collections::HashSet::from([first_table.to_string()]);
+    let mut a = std::collections::HashMap::new();
+    a.insert(first_table.to_string(), std::collections::HashSet::from([first_table.to_string()]));
     let mut u = std::collections::HashSet::from([first_table.to_string()]);
 
     for join in joins.iter() {
@@ -368,48 +369,79 @@ fn verify_derived_table(first_table: &str, joins: &[JoinInfo]) -> (std::collecti
             FKDir::Forward => (join.existing_alias.clone(), join.new_alias.clone()),
         };
 
-        let cond = a.contains(&existing_alias) && join.fk_cols_not_null;
+        let existing_rel_preserves_rows = a.contains_key(&existing_alias) && join.fk_cols_not_null;
+        let existing_rel_self_preserving = a.get(&existing_alias).map(|s| s.contains(&existing_alias)).unwrap_or(false) && join.fk_cols_not_null;
 
-        match (join.join_type, join.arrow, cond) {
-            (JoinType::Left, FKDir::Backward, _) => (),
-            (JoinType::Left, FKDir::Forward, false) => (),
-            (JoinType::Left, FKDir::Forward, true) => {
-                a.insert(new_alias.clone());
+        // Update A based on join type and conditions
+        match (join.join_type, join.arrow, existing_rel_preserves_rows) {
+            (JoinType::Left, _, _) | (JoinType::Full, _, _) => {
+                // A = A (no change)
             },
-            (JoinType::Full, _, _) => {
-                a.insert(new_alias.clone());
+            (JoinType::Right, FKDir::Backward, true) | (JoinType::Inner, FKDir::Backward, true) => {
+                // For each key in A, intersect its value set with A[existing_rel]
+                let existing_set = a.get(&existing_alias).cloned().unwrap_or_default();
+                for set in a.values_mut() {
+                    *set = set.intersection(&existing_set).cloned().collect();
+                }
+                // Add new relation with same preserved set as existing relation
+                a.insert(new_alias.clone(), existing_set);
             },
-            (JoinType::Inner, _, false) => {
+            (JoinType::Right, FKDir::Forward, true) | (JoinType::Inner, FKDir::Forward, true) => {
+                // For each key in A, if it preserves existing_rel, it now only preserves new_rel
+                let keys: Vec<_> = a.keys().cloned().collect();
+                for key in keys {
+                    if let Some(set) = a.get_mut(&key) {
+                        if set.contains(&existing_alias) {
+                            set.clear();
+                            set.insert(new_alias.clone());
+                        } else {
+                            set.clear();
+                        }
+                    }
+                }
+            },
+            (JoinType::Right, _, false) | (JoinType::Inner, _, false) => {
                 a.clear();
-            },
-            (JoinType::Inner, FKDir::Backward, true) => {
-                a = std::collections::HashSet::from([existing_alias.clone()]);
-            },
-            (JoinType::Inner, FKDir::Forward, true) => {
-                a = std::collections::HashSet::from([new_alias.clone()]);
-            },
-            (JoinType::Right, FKDir::Backward, false) => {
-                a = std::collections::HashSet::from([new_alias.clone()]);
-            },
-            (JoinType::Right, FKDir::Backward, true) => {
-                a = std::collections::HashSet::from([existing_alias.clone(), new_alias.clone()]);
-            },
-            (JoinType::Right, FKDir::Forward, _) => {
-                a = std::collections::HashSet::from([new_alias.clone()]);
             },
         }
 
+        // Update A based on self-preservation conditions
+        match (join.join_type, join.arrow, existing_rel_self_preserving) {
+            (JoinType::Right, _, _) | (JoinType::Full, _, _) => {
+                let mut new_set = std::collections::HashSet::new();
+                new_set.insert(new_alias.clone());
+                a.insert(new_alias.clone(), new_set);
+            },
+            (JoinType::Left, FKDir::Forward, true) | (JoinType::Inner, FKDir::Forward, true) => {
+                let mut new_set = std::collections::HashSet::new();
+                new_set.insert(new_alias.clone());
+                a.insert(new_alias.clone(), new_set);
+            },
+            (JoinType::Left, FKDir::Forward, false) | (JoinType::Inner, FKDir::Forward, false) => {
+                // A = A (no change)
+            },
+            (JoinType::Left, FKDir::Backward, _) | (JoinType::Inner, FKDir::Backward, _) => {
+                // A = A (no change)
+            },
+        }
+
+        // Update U based on conditions
         match (join.arrow, u.contains(&existing_alias), join.fk_cols_unique) {
+            (FKDir::Backward, false, _) | (FKDir::Backward, _, false) => {
+                // U = U (no change)
+            },
             (_, true, true) => {
                 u.insert(new_alias.clone());
             },
-            (_, false, true) => (),
-            (FKDir::Backward, false, _) | (FKDir::Backward, _, false) => (),
-            (FKDir::Forward, false, false) => {
-                u.clear();
+            (_, false, true) => {
+                // U = U (no change)
             },
             (FKDir::Forward, true, false) => {
-                u = std::collections::HashSet::from([new_alias.clone()]);
+                u.clear();
+                u.insert(new_alias.clone());
+            },
+            (FKDir::Forward, false, false) => {
+                u.clear();
             },
         }
     }
@@ -923,7 +955,10 @@ fn run_fuzzer(args: &Args) -> Result<(), Box<dyn Error>> {
                 let (theoretical_a, theoretical_u) = verify_derived_table(&first_table, &joins);
 
                 // Print the theoretical sets
-                println!("A: {}", format!("{{{}}}", theoretical_a.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")));
+                println!("A: {}", format!("{{{}}}", theoretical_a.iter()
+                    .map(|(k, v)| format!("{}:{{{}}}", k.as_str(), v.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")))
+                    .collect::<Vec<_>>()
+                    .join(",")));
                 println!("U: {}", format!("{{{}}}", theoretical_u.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")));
                 println!("");  // Extra line for status messages
 
@@ -1304,7 +1339,10 @@ fn run_fuzzer(args: &Args) -> Result<(), Box<dyn Error>> {
                     writeln!(log, "-- New case with {} elements in A and {} elements in U",
                         theoretical_a.len(), theoretical_u.len())?;
                     writeln!(log, "-- Results:")?;
-                    writeln!(log, "-- Theoretical A: {}", format!("{{{}}}", theoretical_a.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")))?;
+                    writeln!(log, "-- Theoretical A: {}", format!("{{{}}}", theoretical_a.iter()
+                        .map(|(k, v)| format!("{}:{{{}}}", k.as_str(), v.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")))
+                        .collect::<Vec<_>>()
+                        .join(",")))?;
                     writeln!(log, "-- Practical A:   {}", format!("{{{}}}", pg_practical.as_ref().unwrap_or(&(None, None)).0.clone().unwrap_or_default()))?;
                     writeln!(log, "-- Theoretical U: {}", format!("{{{}}}", theoretical_u.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")))?;
                     writeln!(log, "-- Practical U:   {}", format!("{{{}}}", pg_practical.as_ref().unwrap_or(&(None, None)).1.clone().unwrap_or_default()))?;
