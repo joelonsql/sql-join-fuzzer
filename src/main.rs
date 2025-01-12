@@ -13,6 +13,7 @@ use uuid::Uuid;
 use std::fs;
 use std::error::Error;
 use ctrlc;
+use std::str::FromStr;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -101,6 +102,10 @@ struct Args {
     /// Maximum number of joins to generate
     #[arg(long, default_value_t = 5)]
     max_num_joins: usize,
+
+    /// Databases to test (pg/postgres/postgresql, sqlite)
+    #[arg(long, value_delimiter = ',', value_parser = Database::from_str, default_value = "pg")]
+    test_dbs: Vec<Database>,
 }
 
 static GLOBAL_COLUMN_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -922,90 +927,167 @@ fn run_fuzzer(args: &Args) -> Result<(), Box<dyn Error>> {
                 println!("U: {}", format!("{{{}}}", theoretical_u.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")));
                 println!("");  // Extra line for status messages
 
-                // Connect to PostgreSQL and execute
-                let db_user = args.db_user.clone().unwrap_or_else(|| env::var("USER").unwrap_or_else(|_| "postgres".to_string()));
-                let conn_string = format!(
-                    "host='{}' port='{}' dbname='{}' user='{}' password='{}'",
-                    args.db_host.replace("'", "\\'"),
-                    args.db_port,
-                    args.db_name.replace("'", "\\'"),
-                    db_user.replace("'", "\\'"),
-                    args.db_password.replace("'", "\\'")
-                );
+                let mut pg_practical = None;
+                let mut sqlite_practical = None;
+                let mut pg_client = None;
+                let mut sqlite_conn = None;
 
-                match Client::connect(&conn_string, NoTls) {
-                    Ok(mut client) => {
-                        // Set statement timeout right after connecting
-                        if let Err(e) = client.batch_execute(&format!("SET statement_timeout = '{}';", args.statement_timeout_ms)) {
-                            let filename = save_error_sql(&output, &e, Some(&format!("SET statement_timeout = '{}';", args.statement_timeout_ms)), None);
-                            eprintln!("SQL saved to {}", filename);
-                            std::process::exit(1);
-                        }
+                // Test PostgreSQL if enabled
+                if args.test_dbs.contains(&Database::PostgreSQL) {
+                    // Connect to PostgreSQL and execute
+                    let db_user = args.db_user.clone().unwrap_or_else(|| env::var("USER").unwrap_or_else(|_| "postgres".to_string()));
+                    let conn_string = format!(
+                        "host='{}' port='{}' dbname='{}' user='{}' password='{}'",
+                        args.db_host.replace("'", "\\'"),
+                        args.db_port,
+                        args.db_name.replace("'", "\\'"),
+                        db_user.replace("'", "\\'"),
+                        args.db_password.replace("'", "\\'")
+                    );
 
-                        println!("\nExecuting queries against PostgreSQL:");
-                        let start = Instant::now();
-                        
-                        // Execute schema reset and SQL statements
-                        if let Err(e) = client.batch_execute(&format!("DROP SCHEMA IF EXISTS {} CASCADE; CREATE SCHEMA {}; SET search_path TO {};",
-                            args.db_name, args.db_name, args.db_name)) {
-                            eprintln!("\nError: Failed to reset database schema");
+                    match Client::connect(&conn_string, NoTls) {
+                        Ok(mut client) => {
+                            println!("\nExecuting queries against PostgreSQL:");
+                            let start = Instant::now();
+
+                            // Execute schema reset and SQL statements
+                            if let Err(e) = client.batch_execute(&format!("DROP SCHEMA IF EXISTS {} CASCADE; CREATE SCHEMA {}; SET search_path TO {};",
+                                args.db_name, args.db_name, args.db_name)) {
+                                eprintln!("\nError: Failed to reset database schema");
+                                eprintln!("Details: {}", e);
+                                eprintln!("\nPlease check:");
+                                eprintln!("1. Is PostgreSQL running?");
+                                eprintln!("2. Can you connect to {}:{} ?", args.db_host, args.db_port);
+                                eprintln!("3. Does user '{}' have permission to create schemas?", db_user);
+                                let filename = save_error_sql(&output, &e, Some(&format!("DROP SCHEMA IF EXISTS {} CASCADE; CREATE SCHEMA {}; SET search_path TO {};",
+                                    args.db_name, args.db_name, args.db_name)), None);
+                                eprintln!("SQL saved to {}", filename);
+                                std::process::exit(1);
+                            }
+                            println!("Schema setup time: {:?}", start.elapsed());
+
+                            // Set statement timeout
+                            if let Err(e) = client.batch_execute(&format!("SET statement_timeout = '{}';", args.statement_timeout_ms)) {
+                                let filename = save_error_sql(&output, &e, Some(&format!("SET statement_timeout = '{}';", args.statement_timeout_ms)), None);
+                                eprintln!("SQL saved to {}", filename);
+                                std::process::exit(1);
+                            }
+
+                            // Execute table creation and data insertion
+                            let start = Instant::now();
+                            for sql in &output {
+                                if let Err(e) = client.batch_execute(sql) {
+                                    let filename = save_error_sql(&output, &e, Some(sql), None);
+                                    eprintln!("SQL saved to {}", filename);
+                                    std::process::exit(1);
+                                }
+                            }
+                            println!("Table creation and data insertion time: {:?}", start.elapsed());
+
+                            // Execute view creation
+                            let start = Instant::now();
+                            if let Err(e) = client.batch_execute(&view_sql) {
+                                let filename = save_error_sql(&output, &e, Some(&view_sql), Some(&view_sql));
+                                eprintln!("SQL saved to {}", filename);
+                                std::process::exit(1);
+                            }
+                            println!("View creation time: {:?}", start.elapsed());
+
+                            // Get practical results from PostgreSQL
+                            let start = Instant::now();
+                            pg_practical = match client.query_one(&verify_sql, &[]) {
+                                Ok(row) => {
+                                    let pg_a: Option<String> = row.get(0);
+                                    let pg_u: Option<String> = row.get(1);
+                                    Some((pg_a, pg_u))
+                                },
+                                Err(e) => return Err(Box::new(FuzzerError::PostgresError(e, ErrorContext {
+                                    output: output.clone(),
+                                    query: Some(verify_sql.clone()),
+                                    view_sql: Some(view_sql.clone()),
+                                }))),
+                            };
+                            println!("PostgreSQL query execution time: {:?}", start.elapsed());
+                            pg_client = Some(client);
+                        },
+                        Err(e) => {
+                            eprintln!("\nError: Failed to connect to database");
                             eprintln!("Details: {}", e);
                             eprintln!("\nPlease check:");
                             eprintln!("1. Is PostgreSQL running?");
                             eprintln!("2. Can you connect to {}:{} ?", args.db_host, args.db_port);
-                            eprintln!("3. Does user '{}' have permission to create schemas?", db_user);
-                            let filename = save_error_sql(&output, &e, Some(&format!("DROP SCHEMA IF EXISTS {} CASCADE; CREATE SCHEMA {}; SET search_path TO {};",
-                                args.db_name, args.db_name, args.db_name)), None);
-                            eprintln!("SQL saved to {}", filename);
-                            std::process::exit(1);
+                            eprintln!("3. Are the database credentials correct?");
+                            eprintln!("   - Database: {}", args.db_name);
+                            eprintln!("   - User: {}", db_user);
+                            eprintln!("   - Host: {}", args.db_host);
+                            eprintln!("   - Port: {}", args.db_port);
+                            return Err(Box::new(FuzzerError::PostgresError(
+                                e,
+                                ErrorContext {
+                                    output: output.clone(),
+                                    query: Some(conn_string.clone()),
+                                    view_sql: None,
+                                }
+                            )));
                         }
-                        println!("Schema setup time: {:?}", start.elapsed());
+                    }
+                }
 
-                        // Execute table creation and data insertion
-                        let start = Instant::now();
-                        for sql in &output {
-                            if let Err(e) = client.batch_execute(sql) {
-                                let filename = save_error_sql(&output, &e, Some(sql), None);
-                                eprintln!("SQL saved to {}", filename);
-                                std::process::exit(1);
+                // Test SQLite if enabled
+                if args.test_dbs.contains(&Database::SQLite) {
+                    println!("\nExecuting queries against SQLite:");
+                    let sqlite_db = format!("{}.db", Uuid::new_v4());
+                    let start = Instant::now();
+                    let sqlite = Connection::open(&sqlite_db)?;
+
+                    // Execute schema and data insertion in SQLite
+                    for sql in &output {
+                        if let Err(e) = sqlite.execute(sql, []) {
+                            // Ignore SQLITE_OK status
+                            if let rusqlite::Error::SqliteFailure(error, _) = &e {
+                                if error.extended_code == 21 {
+                                    continue;
+                                }
                             }
-                        }
-                        println!("Table creation and data insertion time: {:?}", start.elapsed());
-
-                        // Execute view creation
-                        let start = Instant::now();
-                        if let Err(e) = client.batch_execute(&view_sql) {
-                            let filename = save_error_sql(&output, &e, Some(&view_sql), Some(&view_sql));
-                            eprintln!("SQL saved to {}", filename);
-                            std::process::exit(1);
-                        }
-                        println!("View creation time: {:?}", start.elapsed());
-
-                        // Get practical results from PostgreSQL
-                        let start = Instant::now();
-                        let pg_practical = match client.query_one(&verify_sql, &[]) {
-                            Ok(row) => {
-                                let pg_a: Option<String> = row.get(0);
-                                let pg_u: Option<String> = row.get(1);
-                                (pg_a, pg_u)
-                            },
-                            Err(e) => return Err(Box::new(FuzzerError::PostgresError(e, ErrorContext {
+                            return Err(Box::new(FuzzerError::SQLiteError(e, ErrorContext {
                                 output: output.clone(),
-                                query: Some(verify_sql.clone()),
+                                query: Some(sql.clone()),
                                 view_sql: Some(view_sql.clone()),
-                            }))),
-                        };
-                        println!("PostgreSQL query execution time: {:?}", start.elapsed());
+                            })));
+                        }
+                    }
+                    println!("Table creation and data insertion time: {:?}", start.elapsed());
 
-                        // Create SQLite database and execute schema
-                        println!("\nExecuting queries against SQLite:");
-                        let sqlite_db = format!("{}.db", Uuid::new_v4());
-                        let start = Instant::now();
-                        let sqlite = Connection::open(&sqlite_db)?;
-                        
-                        // Execute schema and data insertion in SQLite
-                        for sql in &output {
-                            if let Err(e) = sqlite.execute(sql, []) {
+                    // Execute view creation in SQLite
+                    let start = Instant::now();
+                    if let Err(e) = sqlite.execute(&view_sql, []) {
+                        // Ignore SQLITE_OK status
+                        if let rusqlite::Error::SqliteFailure(error, _) = &e {
+                            if error.extended_code == 21 {
+                                // Continue without error
+                            } else {
+                                return Err(Box::new(FuzzerError::SQLiteError(e, ErrorContext {
+                                    output: output.clone(),
+                                    query: Some(view_sql.clone()),
+                                    view_sql: Some(view_sql.clone()),
+                                })));
+                            }
+                        } else {
+                            return Err(Box::new(FuzzerError::SQLiteError(e, ErrorContext {
+                                output: output.clone(),
+                                query: Some(view_sql.clone()),
+                                view_sql: Some(view_sql.clone()),
+                            })));
+                        }
+                    }
+                    println!("View creation time: {:?}", start.elapsed());
+
+                    // Get practical results from SQLite
+                    let start = Instant::now();
+                    sqlite_practical = {
+                        let mut stmt = match sqlite.prepare(&verify_sql) {
+                            Ok(stmt) => stmt,
+                            Err(e) => {
                                 // Ignore SQLITE_OK status
                                 if let rusqlite::Error::SqliteFailure(error, _) = &e {
                                     if error.extended_code == 21 {
@@ -1014,287 +1096,234 @@ fn run_fuzzer(args: &Args) -> Result<(), Box<dyn Error>> {
                                 }
                                 return Err(Box::new(FuzzerError::SQLiteError(e, ErrorContext {
                                     output: output.clone(),
-                                    query: Some(sql.clone()),
+                                    query: Some(verify_sql.clone()),
                                     view_sql: Some(view_sql.clone()),
                                 })));
-                            }
-                        }
-                        println!("Table creation and data insertion time: {:?}", start.elapsed());
-
-                        // Execute view creation in SQLite
-                        let start = Instant::now();
-                        if let Err(e) = sqlite.execute(&view_sql, []) {
-                            // Ignore SQLITE_OK status
-                            if let rusqlite::Error::SqliteFailure(error, _) = &e {
-                                if error.extended_code == 21 {
-                                    // Continue without error
-                                } else {
-                                    return Err(Box::new(FuzzerError::SQLiteError(e, ErrorContext {
-                                        output: output.clone(),
-                                        query: Some(view_sql.clone()),
-                                        view_sql: Some(view_sql.clone()),
-                                    })));
-                                }
-                            } else {
-                                return Err(Box::new(FuzzerError::SQLiteError(e, ErrorContext {
-                                    output: output.clone(),
-                                    query: Some(view_sql.clone()),
-                                    view_sql: Some(view_sql.clone()),
-                                })));
-                            }
-                        }
-                        println!("View creation time: {:?}", start.elapsed());
-
-                        // Get practical results from SQLite
-                        let start = Instant::now();
-                        let sqlite_practical = {
-                            let mut stmt = match sqlite.prepare(&verify_sql) {
-                                Ok(stmt) => stmt,
-                                Err(e) => {
-                                    // Ignore SQLITE_OK status
-                                    if let rusqlite::Error::SqliteFailure(error, _) = &e {
-                                        if error.extended_code == 21 {
-                                            continue;
-                                        }
-                                    }
-                                    return Err(Box::new(FuzzerError::SQLiteError(e, ErrorContext {
-                                        output: output.clone(),
-                                        query: Some(verify_sql.clone()),
-                                        view_sql: Some(view_sql.clone()),
-                                    })));
-                                }
-                            };
-                            let mut rows = match stmt.query([]) {
-                                Ok(rows) => rows,
-                                Err(e) => {
-                                    // Ignore SQLITE_OK status
-                                    if let rusqlite::Error::SqliteFailure(error, _) = &e {
-                                        if error.extended_code == 21 {
-                                            continue;
-                                        }
-                                    }
-                                    return Err(Box::new(FuzzerError::SQLiteError(e, ErrorContext {
-                                        output: output.clone(),
-                                        query: Some(verify_sql.clone()),
-                                        view_sql: Some(view_sql.clone()),
-                                    })));
-                                }
-                            };
-                            if let Some(row) = rows.next()? {
-                                let sqlite_a: Option<String> = row.get(0)?;
-                                let sqlite_u: Option<String> = row.get(1)?;
-                                (sqlite_a, sqlite_u)
-                            } else {
-                                (None, None)
                             }
                         };
-                        println!("Verification query time: {:?}", start.elapsed());
-
-                        // Compare practical results between PostgreSQL and SQLite
-                        if pg_practical != sqlite_practical {
-                            println!("PostgreSQL and SQLite practical results differ!");
-                            println!("PostgreSQL A: {:?}, U: {:?}", pg_practical.0, pg_practical.1);
-                            println!("SQLite    A: {:?}, U: {:?}", sqlite_practical.0, sqlite_practical.1);
-                            return Err(Box::new(FuzzerError::ComparisonError(
-                                "PostgreSQL and SQLite practical A/U sets differ".to_string(),
-                                ErrorContext {
+                        let mut rows = match stmt.query([]) {
+                            Ok(rows) => rows,
+                            Err(e) => {
+                                // Ignore SQLITE_OK status
+                                if let rusqlite::Error::SqliteFailure(error, _) = &e {
+                                    if error.extended_code == 21 {
+                                        continue;
+                                    }
+                                }
+                                return Err(Box::new(FuzzerError::SQLiteError(e, ErrorContext {
                                     output: output.clone(),
                                     query: Some(verify_sql.clone()),
                                     view_sql: Some(view_sql.clone()),
-                                }
-                            )));
-                        } else {
-                            println!("PostgreSQL and SQLite practical results are identical");
-                        }
-
-                        // Compare actual results
-                        let order_by_columns: Vec<_> = table_aliases.iter()
-                            .map(|(_, alias)| {
-                                format!("CASE WHEN {0}_id IS NULL THEN -1 ELSE {0}_id END", alias)
-                            })
-                            .collect();
-                        let compare_sql = format!("SELECT * FROM v ORDER BY {}", order_by_columns.join(", "));
-                        let pg_rows = client.query(&compare_sql, &[])?;
-                        let sqlite_rows = {
-                            let mut stmt = match sqlite.prepare(&compare_sql) {
-                                Ok(stmt) => stmt,
-                                Err(e) => {
-                                    // Ignore SQLITE_OK status
-                                    if let rusqlite::Error::SqliteFailure(error, _) = &e {
-                                        if error.extended_code == 21 {
-                                            continue;
-                                        }
-                                    }
-                                    return Err(Box::new(FuzzerError::SQLiteError(e, ErrorContext {
-                                        output: output.clone(),
-                                        query: Some(compare_sql.to_string()),
-                                        view_sql: Some(view_sql.clone()),
-                                    })));
-                                }
-                            };
-                            let column_count = stmt.column_count();
-                            let rows = match stmt.query_map([], |row| {
-                                let mut values = Vec::new();
-                                for i in 0..column_count {
-                                    values.push(row.get::<_, Option<i32>>(i).unwrap_or(None));
-                                }
-                                Ok(values)
-                            }) {
-                                Ok(rows) => rows,
-                                Err(e) => {
-                                    // Ignore SQLITE_OK status
-                                    if let rusqlite::Error::SqliteFailure(error, _) = &e {
-                                        if error.extended_code == 21 {
-                                            continue;
-                                        }
-                                    }
-                                    return Err(Box::new(FuzzerError::SQLiteError(e, ErrorContext {
-                                        output: output.clone(),
-                                        query: Some(compare_sql.to_string()),
-                                        view_sql: Some(view_sql.clone()),
-                                    })));
-                                }
-                            };
-                            match rows.collect::<Result<Vec<_>, _>>() {
-                                Ok(rows) => rows,
-                                Err(e) => {
-                                    // Ignore SQLITE_OK status
-                                    if let rusqlite::Error::SqliteFailure(error, _) = &e {
-                                        if error.extended_code == 21 {
-                                            continue;
-                                        }
-                                    }
-                                    return Err(Box::new(FuzzerError::SQLiteError(e, ErrorContext {
-                                        output: output.clone(),
-                                        query: Some(compare_sql.to_string()),
-                                        view_sql: Some(view_sql.clone()),
-                                    })));
-                                }
+                                })));
                             }
                         };
-
-                        // Convert and compare results
-                        let pg_values: Vec<Vec<Option<i32>>> = pg_rows.iter().map(|row| {
-                            let mut values = Vec::new();
-                            for i in 0..row.len() {
-                                values.push(row.get(i));
-                            }
-                            values
-                        }).collect();
-
-                        // Write results to CSV files for diff
-                        let pg_file = format!("{}_pg.csv", Uuid::new_v4());
-                        let sqlite_file = format!("{}_sqlite.csv", Uuid::new_v4());
-                        
-                        let mut pg_writer = File::create(&pg_file)?;
-                        for row in &pg_values {
-                            writeln!(pg_writer, "{}", row.iter()
-                                .map(|v| match v {
-                                    Some(n) => n.to_string(),
-                                    None => "NULL".to_string(),
-                                })
-                                .collect::<Vec<_>>()
-                                .join(","))?;
-                        }
-
-                        let mut sqlite_writer = File::create(&sqlite_file)?;
-                        for row in &sqlite_rows {
-                            writeln!(sqlite_writer, "{}", row.iter()
-                                .map(|v| match v {
-                                    Some(n) => n.to_string(),
-                                    None => "NULL".to_string(),
-                                })
-                                .collect::<Vec<_>>()
-                                .join(","))?;
-                        }
-
-                        // Compare results with git diff
-                        let diff_output = std::process::Command::new("git")
-                            .args(["diff", "--no-index", "--color=always", &pg_file, &sqlite_file])
-                            .output()?;
-
-                        // Clean up temporary files
-                        fs::remove_file(&pg_file)?;
-                        fs::remove_file(&sqlite_file)?;
-                        fs::remove_file(&sqlite_db)?;
-
-                        if !diff_output.status.success() {
-                            let error_msg = String::from_utf8_lossy(&diff_output.stdout);
-                            if error_msg.trim().is_empty() {
-                                let stderr_msg = String::from_utf8_lossy(&diff_output.stderr);
-                                if !stderr_msg.trim().is_empty() {
-                                    println!("{}", stderr_msg);
-                                }
-                            } else {
-                                println!("{}", error_msg);
-                            }
-                            
-                            let mut error_output = Vec::new();
-                            error_output.push(String::from_utf8_lossy(&diff_output.stdout).into_owned());
-                            error_output.push(String::from_utf8_lossy(&diff_output.stderr).into_owned());
-                            
-                            return Err(Box::new(FuzzerError::ComparisonError(
-                                "PostgreSQL and SQLite results differ".to_string(),
-                                ErrorContext {
-                                    output: error_output,
-                                    query: Some(compare_sql.to_string()),
-                                    view_sql: None,
-                                }
-                            )));
+                        if let Some(row) = rows.next()? {
+                            let sqlite_a: Option<String> = row.get(0)?;
+                            let sqlite_u: Option<String> = row.get(1)?;
+                            Some((sqlite_a, sqlite_u))
                         } else {
-                            println!("PostgreSQL and SQLite results are identical");
+                            None
                         }
+                    };
+                    println!("Verification query time: {:?}", start.elapsed());
+                    sqlite_conn = Some((sqlite, sqlite_db));
+                }
 
-                        // Check if this is a new case
-                        let filename = format!("joins_{}A_{}U.sql", theoretical_a.len(), theoretical_u.len());
-                        if !std::path::Path::new(&filename).exists() {
-                            // Log successful new case
-                            let mut log = std::fs::File::create(&filename)?;
-                            writeln!(log, "-- New case with {} elements in A and {} elements in U",
-                                theoretical_a.len(), theoretical_u.len())?;
-                            writeln!(log, "-- Results:")?;
-                            writeln!(log, "-- Theoretical A: {}", format!("{{{}}}", theoretical_a.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")))?;
-                            writeln!(log, "-- Practical A:   {}", format!("{{{}}}", pg_practical.0.unwrap_or_default()))?;
-                            writeln!(log, "-- Theoretical U: {}", format!("{{{}}}", theoretical_u.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")))?;
-                            writeln!(log, "-- Practical U:   {}", format!("{{{}}}", pg_practical.1.unwrap_or_default()))?;
-                            writeln!(log)?;
-
-                            // Write all SQL statements
-                            for sql in &output {
-                                writeln!(log, "{}", sql)?;
-                            }
-                            writeln!(log, "\n\n")?;  // Add extra newline before view
-                            writeln!(log, "{}", view_sql)?;
-                            writeln!(log, "\n\n")?;  // Add extra newline before verification
-                            writeln!(log, "{}", verify_sql)?;
-                            writeln!(log, "\n")?;
-
-                            println!("Found new case! Saved to {}", filename);
-                        }
-
-                        continue;
-                    },
-                    Err(e) => {
-                        eprintln!("\nError: Failed to connect to database");
-                        eprintln!("Details: {}", e);
-                        eprintln!("\nPlease check:");
-                        eprintln!("1. Is PostgreSQL running?");
-                        eprintln!("2. Can you connect to {}:{} ?", args.db_host, args.db_port);
-                        eprintln!("3. Are the database credentials correct?");
-                        eprintln!("   - Database: {}", args.db_name);
-                        eprintln!("   - User: {}", db_user);
-                        eprintln!("   - Host: {}", args.db_host);
-                        eprintln!("   - Port: {}", args.db_port);
-                        return Err(Box::new(FuzzerError::PostgresError(
-                            e,
+                // Compare results between databases if both were tested
+                if let (Some(pg_results), Some(sqlite_results)) = (&pg_practical, &sqlite_practical) {
+                    if pg_results != sqlite_results {
+                        println!("PostgreSQL and SQLite practical results differ!");
+                        println!("PostgreSQL A: {:?}, U: {:?}", pg_results.0, pg_results.1);
+                        println!("SQLite    A: {:?}, U: {:?}", sqlite_results.0, sqlite_results.1);
+                        return Err(Box::new(FuzzerError::ComparisonError(
+                            "PostgreSQL and SQLite practical A/U sets differ".to_string(),
                             ErrorContext {
                                 output: output.clone(),
-                                query: Some(conn_string.clone()),
+                                query: Some(verify_sql.clone()),
+                                view_sql: Some(view_sql.clone()),
+                            }
+                        )));
+                    } else {
+                        println!("PostgreSQL and SQLite practical results are identical");
+                    }
+
+                    // Compare actual results
+                    let order_by_columns: Vec<_> = table_aliases.iter()
+                        .map(|(_, alias)| {
+                            format!("CASE WHEN {0}_id IS NULL THEN -1 ELSE {0}_id END", alias)
+                        })
+                        .collect();
+                    let compare_sql = format!("SELECT * FROM v ORDER BY {}", order_by_columns.join(", "));
+
+                    // Get PostgreSQL results
+                    let pg_rows = if let Some(client) = &mut pg_client {
+                        client.query(&compare_sql, &[])?
+                    } else {
+                        Vec::new()
+                    };
+                    let pg_values: Vec<Vec<Option<i32>>> = pg_rows.iter().map(|row| {
+                        let mut values = Vec::new();
+                        for i in 0..row.len() {
+                            values.push(row.get(i));
+                        }
+                        values
+                    }).collect();
+
+                    // Get SQLite results
+                    let sqlite_rows = if let Some((ref sqlite, _)) = sqlite_conn {
+                        let mut stmt = match sqlite.prepare(&compare_sql) {
+                            Ok(stmt) => stmt,
+                            Err(e) => {
+                                // Ignore SQLITE_OK status
+                                if let rusqlite::Error::SqliteFailure(error, _) = &e {
+                                    if error.extended_code == 21 {
+                                        continue;
+                                    }
+                                }
+                                return Err(Box::new(FuzzerError::SQLiteError(e, ErrorContext {
+                                    output: output.clone(),
+                                    query: Some(compare_sql.to_string()),
+                                    view_sql: Some(view_sql.clone()),
+                                })));
+                            }
+                        };
+                        let column_count = stmt.column_count();
+                        let rows = match stmt.query_map([], |row| {
+                            let mut values = Vec::new();
+                            for i in 0..column_count {
+                                values.push(row.get::<_, Option<i32>>(i).unwrap_or(None));
+                            }
+                            Ok(values)
+                        }) {
+                            Ok(rows) => rows,
+                            Err(e) => {
+                                // Ignore SQLITE_OK status
+                                if let rusqlite::Error::SqliteFailure(error, _) = &e {
+                                    if error.extended_code == 21 {
+                                        continue;
+                                    }
+                                }
+                                return Err(Box::new(FuzzerError::SQLiteError(e, ErrorContext {
+                                    output: output.clone(),
+                                    query: Some(compare_sql.to_string()),
+                                    view_sql: Some(view_sql.clone()),
+                                })));
+                            }
+                        };
+                        match rows.collect::<Result<Vec<_>, _>>() {
+                            Ok(rows) => rows,
+                            Err(e) => {
+                                // Ignore SQLITE_OK status
+                                if let rusqlite::Error::SqliteFailure(error, _) = &e {
+                                    if error.extended_code == 21 {
+                                        continue;
+                                    }
+                                }
+                                return Err(Box::new(FuzzerError::SQLiteError(e, ErrorContext {
+                                    output: output.clone(),
+                                    query: Some(compare_sql.to_string()),
+                                    view_sql: Some(view_sql.clone()),
+                                })));
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    };
+
+                    // Write results to CSV files for diff
+                    let pg_file = format!("{}_pg.csv", Uuid::new_v4());
+                    let sqlite_file = format!("{}_sqlite.csv", Uuid::new_v4());
+
+                    let mut pg_writer = File::create(&pg_file)?;
+                    for row in &pg_values {
+                        writeln!(pg_writer, "{}", row.iter()
+                            .map(|v| match v {
+                                Some(n) => n.to_string(),
+                                None => "NULL".to_string(),
+                            })
+                            .collect::<Vec<_>>()
+                            .join(","))?;
+                    }
+
+                    let mut sqlite_writer = File::create(&sqlite_file)?;
+                    for row in &sqlite_rows {
+                        writeln!(sqlite_writer, "{}", row.iter()
+                            .map(|v| match v {
+                                Some(n) => n.to_string(),
+                                None => "NULL".to_string(),
+                            })
+                            .collect::<Vec<_>>()
+                            .join(","))?;
+                    }
+
+                    // Compare results with git diff
+                    let diff_output = std::process::Command::new("git")
+                        .args(["diff", "--no-index", "--color=always", &pg_file, &sqlite_file])
+                        .output()?;
+
+                    // Clean up temporary files
+                    fs::remove_file(&pg_file)?;
+                    fs::remove_file(&sqlite_file)?;
+                    if let Some((_, sqlite_db)) = sqlite_conn {
+                        fs::remove_file(&sqlite_db)?;
+                    }
+
+                    if !diff_output.status.success() {
+                        let error_msg = String::from_utf8_lossy(&diff_output.stdout);
+                        if error_msg.trim().is_empty() {
+                            let stderr_msg = String::from_utf8_lossy(&diff_output.stderr);
+                            if !stderr_msg.trim().is_empty() {
+                                println!("{}", stderr_msg);
+                            }
+                        } else {
+                            println!("{}", error_msg);
+                        }
+
+                        let mut error_output = Vec::new();
+                        error_output.push(String::from_utf8_lossy(&diff_output.stdout).into_owned());
+                        error_output.push(String::from_utf8_lossy(&diff_output.stderr).into_owned());
+
+                        return Err(Box::new(FuzzerError::ComparisonError(
+                            "PostgreSQL and SQLite results differ".to_string(),
+                            ErrorContext {
+                                output: error_output,
+                                query: Some(compare_sql.to_string()),
                                 view_sql: None,
                             }
                         )));
+                    } else {
+                        println!("PostgreSQL and SQLite practical results are identical");
                     }
                 }
+
+                // Check if this is a new case
+                let filename = format!("joins_{}A_{}U.sql", theoretical_a.len(), theoretical_u.len());
+                if !std::path::Path::new(&filename).exists() {
+                    // Log successful new case
+                    let mut log = std::fs::File::create(&filename)?;
+                    writeln!(log, "-- New case with {} elements in A and {} elements in U",
+                        theoretical_a.len(), theoretical_u.len())?;
+                    writeln!(log, "-- Results:")?;
+                    writeln!(log, "-- Theoretical A: {}", format!("{{{}}}", theoretical_a.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")))?;
+                    writeln!(log, "-- Practical A:   {}", format!("{{{}}}", pg_practical.as_ref().unwrap_or(&(None, None)).0.clone().unwrap_or_default()))?;
+                    writeln!(log, "-- Theoretical U: {}", format!("{{{}}}", theoretical_u.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")))?;
+                    writeln!(log, "-- Practical U:   {}", format!("{{{}}}", pg_practical.as_ref().unwrap_or(&(None, None)).1.clone().unwrap_or_default()))?;
+                    writeln!(log)?;
+
+                    // Write all SQL statements
+                    for sql in &output {
+                        writeln!(log, "{}", sql)?;
+                    }
+                    writeln!(log, "\n\n")?;  // Add extra newline before view
+                    writeln!(log, "{}", view_sql)?;
+                    writeln!(log, "\n\n")?;  // Add extra newline before verification
+                    writeln!(log, "{}", verify_sql)?;
+                    writeln!(log, "\n")?;
+
+                    println!("Found new case! Saved to {}", filename);
+                }
+
+                continue;
             }
         }
     }
@@ -1374,7 +1403,24 @@ fn save_error_sql(output: &[String], error: &impl std::fmt::Display, failed_quer
     filename
 }
 
-// Add these helper functions
+#[derive(Debug, Clone, PartialEq)]
+enum Database {
+    PostgreSQL,
+    SQLite,
+}
+
+impl FromStr for Database {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "pg" | "postgres" | "postgresql" => Ok(Database::PostgreSQL),
+            "sqlite" => Ok(Database::SQLite),
+            _ => Err(format!("Invalid database name: {}", s))
+        }
+    }
+}
+
 fn create_view_sql(first_table: &str, joins: &[JoinInfo], table_aliases: &[(String, String)], join_syntax: &str) -> String {
     let mut sql = String::from("-- This view represents the derived table created by the join sequence.\n");
     sql.push_str("-- Each table's ID is selected to track which rows from the base tables appear in the result.\n");
