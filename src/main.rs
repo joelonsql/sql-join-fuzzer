@@ -1022,6 +1022,16 @@ fn run_fuzzer(args: &Args) -> Result<(), Box<dyn Error>> {
                             // Execute view creation
                             let start = Instant::now();
                             if let Err(e) = client.batch_execute(&view_sql) {
+                                // Check if this is a statement timeout
+                                if e.as_db_error()
+                                    .map(|dbe| dbe.message().contains("canceling statement due to statement timeout"))
+                                    .unwrap_or(false)
+                                {
+                                    // Save error to file but continue
+                                    let filename = save_error_sql(&output, &e, Some(&view_sql), Some(&view_sql));
+                                    println!("Statement timeout occurred during view creation. SQL saved to {}", filename);
+                                    return Ok(());
+                                }
                                 let filename = save_error_sql(&output, &e, Some(&view_sql), Some(&view_sql));
                                 eprintln!("SQL saved to {}", filename);
                                 std::process::exit(1);
@@ -1036,14 +1046,108 @@ fn run_fuzzer(args: &Args) -> Result<(), Box<dyn Error>> {
                                     let pg_u: Option<String> = row.get(1);
                                     Some((pg_a, pg_u))
                                 },
-                                Err(e) => return Err(Box::new(FuzzerError::PostgresError(e, ErrorContext {
-                                    output: output.clone(),
-                                    query: Some(verify_sql.clone()),
-                                    view_sql: Some(view_sql.clone()),
-                                }))),
+                                Err(e) => {
+                                    // Check if this is a statement timeout
+                                    if e.as_db_error()
+                                        .map(|dbe| dbe.message().contains("canceling statement due to statement timeout"))
+                                        .unwrap_or(false)
+                                    {
+                                        // Save error to file but continue
+                                        let filename = save_error_sql(&output, &e, Some(&verify_sql), Some(&view_sql));
+                                        println!("Statement timeout occurred. SQL saved to {}", filename);
+                                        None
+                                    } else {
+                                        // For other errors, return as normal
+                                        return Err(Box::new(FuzzerError::PostgresError(e, ErrorContext {
+                                            output: output.clone(),
+                                            query: Some(verify_sql.clone()),
+                                            view_sql: Some(view_sql.clone()),
+                                        })));
+                                    }
+                                },
                             };
                             println!("PostgreSQL query execution time: {:?}", start.elapsed());
                             pg_client = Some(client);
+
+                            // Compare theoretical and practical results
+                            if let Some((pg_a, pg_u)) = &pg_practical {
+                                // Convert theoretical_a to simpler format - keep only self-preserving relations
+                                let theoretical_a_simple: std::collections::HashSet<String> = theoretical_a.iter()
+                                    .filter(|(k, v)| v.contains(*k))
+                                    .map(|(k, _)| k.clone())
+                                    .collect();
+
+                                // Parse practical results into HashSets
+                                let practical_a: std::collections::HashSet<String> = pg_a.as_ref()
+                                    .map(|s| s.split(',').map(|s| s.to_string()).collect())
+                                    .unwrap_or_default();
+                                let practical_u: std::collections::HashSet<String> = pg_u.as_ref()
+                                    .map(|s| s.split(',').map(|s| s.to_string()).collect())
+                                    .unwrap_or_default();
+
+                                // Check if theoretical sets are subsets of practical sets
+                                let missing_a: Vec<_> = theoretical_a_simple.difference(&practical_a).collect();
+                                let missing_u: Vec<_> = theoretical_u.difference(&practical_u).collect();
+                                let extra_a: Vec<_> = practical_a.difference(&theoretical_a_simple).collect();
+                                let extra_u: Vec<_> = practical_u.difference(&theoretical_u).collect();
+
+                                if !missing_a.is_empty() || !missing_u.is_empty() {
+                                    println!("\nTheoretical vs Practical Results Mismatch!");
+                                    if !missing_a.is_empty() {
+                                        println!("Missing from practical A: {}", missing_a.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+                                    }
+                                    if !missing_u.is_empty() {
+                                        println!("Missing from practical U: {}", missing_u.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+                                    }
+                                    return Err(Box::new(FuzzerError::ComparisonError(
+                                        "Theoretical relations missing from practical results".to_string(),
+                                        ErrorContext {
+                                            output: output.clone(),
+                                            query: Some(verify_sql.clone()),
+                                            view_sql: Some(view_sql.clone()),
+                                        }
+                                    )));
+                                }
+
+                                if !extra_a.is_empty() {
+                                    println!("\nAdditional relations found in practical A: {}", extra_a.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+                                }
+                                if !extra_u.is_empty() {
+                                    println!("\nAdditional relations found in practical U: {}", extra_u.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+                                }
+
+                                // Store cases with extra relations
+                                if !extra_a.is_empty() || !extra_u.is_empty() {
+                                    let extra_filename = format!("extra_{}A_{}U.sql", extra_a.len(), extra_u.len());
+                                    if !std::path::Path::new(&extra_filename).exists() {
+                                        let mut log = std::fs::File::create(&extra_filename)?;
+                                        writeln!(log, "-- Case with {} extra A relations and {} extra U relations", extra_a.len(), extra_u.len())?;
+                                        writeln!(log, "-- Results:")?;
+                                        writeln!(log, "-- Theoretical A: {}", format!("{{{}}}", theoretical_a.iter()
+                                            .map(|(k, v)| format!("{}:{{{}}}", k.as_str(), v.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")))
+                                            .collect::<Vec<_>>()
+                                            .join(",")))?;
+                                        writeln!(log, "-- Practical A:   {}", pg_a.clone().unwrap_or_default())?;
+                                        writeln!(log, "-- Extra A:       {}", format!("{{{}}}", extra_a.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")))?;
+                                        writeln!(log, "-- Theoretical U: {}", format!("{{{}}}", theoretical_u.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")))?;
+                                        writeln!(log, "-- Practical U:   {}", pg_u.clone().unwrap_or_default())?;
+                                        writeln!(log, "-- Extra U:       {}", format!("{{{}}}", extra_u.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")))?;
+                                        writeln!(log)?;
+
+                                        // Write all SQL statements
+                                        for sql in &output {
+                                            writeln!(log, "{}", sql)?;
+                                        }
+                                        writeln!(log, "\n\n")?;
+                                        writeln!(log, "{}", view_sql)?;
+                                        writeln!(log, "\n\n")?;
+                                        writeln!(log, "{}", verify_sql)?;
+                                        writeln!(log, "\n")?;
+
+                                        println!("Found new case with extra relations! Saved to {}", extra_filename);
+                                    }
+                                }
+                            }
                         },
                         Err(e) => {
                             eprintln!("\nError: Failed to connect to database");
