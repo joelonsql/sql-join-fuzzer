@@ -595,7 +595,8 @@ fn generate_fk_join_query(tables: &[Table], num_joins: usize, rng: &mut impl Rng
         }
 
         let rel = valid_relationships.choose(rng).unwrap();
-        let ref_table_is_used = used_aliases.iter().any(|a| a.table_name == rel.0);
+        let ref_table_is_used = used_aliases.iter()
+            .any(|a| a.table_name == rel.0);
 
         if ref_table_is_used {
             let new_alias = get_alias(&rel.2, &mut alias_counter);
@@ -941,8 +942,10 @@ fn run_fuzzer(args: &Args) -> Result<(), Box<dyn Error>> {
                 }
 
                 // Create view and verification queries
-                let view_sql = create_view_sql(&first_table, &joins, &table_aliases, &args.join_syntax);
+                let (theoretical_a, theoretical_u) = verify_derived_table(&first_table, &joins);
+                let view_sql = create_view_sql(&first_table, &joins, &table_aliases, &args.join_syntax, &tables);
                 let verify_sql = create_verify_sql(&table_aliases);
+                let (valid_test, invalid_test) = create_fk_join_tests(&tables, &first_table, &joins, &theoretical_a, &theoretical_u);
 
                 // Save current SQL to file for debugging
                 let mut current_sql = File::create("join_fuzzer_current.sql")?;
@@ -951,11 +954,16 @@ fn run_fuzzer(args: &Args) -> Result<(), Box<dyn Error>> {
                 for sql in &output {
                     writeln!(current_sql, "{}", sql)?;
                 }
-                writeln!(current_sql)?;
-                writeln!(current_sql, "-- View definition")?;
+                writeln!(current_sql, "\n-- View definition")?;
                 writeln!(current_sql, "{}", view_sql)?;
-                writeln!(current_sql)?;
-                writeln!(current_sql, "-- Verification query")?;
+                writeln!(current_sql, "\n-- Foreign Key Join Tests")?;
+                if let Some(test) = &valid_test {
+                    writeln!(current_sql, "{}\n", test)?;
+                }
+                if let Some(test) = &invalid_test {
+                    writeln!(current_sql, "{}\n", test)?;
+                }
+                writeln!(current_sql, "\n-- Verification query")?;
                 writeln!(current_sql, "{}", verify_sql)?;
 
                 // Get theoretical results
@@ -1044,6 +1052,40 @@ fn run_fuzzer(args: &Args) -> Result<(), Box<dyn Error>> {
                                 std::process::exit(1);
                             }
                             println!("View creation time: {:?}", start.elapsed());
+
+                            // Execute foreign key join tests
+                            let start = Instant::now();
+                            let (valid_test, invalid_test) = create_fk_join_tests(&tables, &first_table, &joins, &theoretical_a, &theoretical_u);
+
+                            // Execute valid test if present
+                            if let Some(test) = valid_test {
+                                if let Err(e) = client.batch_execute(&test) {
+                                    let error_msg = e.to_string();
+                                    let filename = save_error_sql(&output, &format!("Valid foreign key join failed: {}", error_msg), Some(&test), Some(&view_sql));
+                                    eprintln!("SQL saved to {}", filename);
+                                    std::process::exit(1);
+                                }
+                            }
+
+                            // Execute invalid test if present
+                            if let Some(test) = invalid_test {
+                                match client.batch_execute(&test) {
+                                    Ok(_) => {
+                                        let filename = save_error_sql(&output, &"Invalid foreign key join did not fail as expected", Some(&test), Some(&view_sql));
+                                        eprintln!("SQL saved to {}", filename);
+                                        std::process::exit(1);
+                                    },
+                                    Err(e) => {
+                                        let error_msg = e.to_string();
+                                        if !error_msg.contains("virtual foreign key constraint violation") {
+                                            let filename = save_error_sql(&output, &format!("Invalid foreign key join failed with wrong error: {}", error_msg), Some(&test), Some(&view_sql));
+                                            eprintln!("SQL saved to {}", filename);
+                                            std::process::exit(1);
+                                        }
+                                    }
+                                }
+                            }
+                            println!("Foreign key join tests time: {:?}", start.elapsed());
 
                             // Get practical results from PostgreSQL
                             let start = Instant::now();
@@ -1134,11 +1176,16 @@ fn run_fuzzer(args: &Args) -> Result<(), Box<dyn Error>> {
                                             .map(|(k, v)| format!("{}:{{{}}}", k.as_str(), v.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")))
                                             .collect::<Vec<_>>()
                                             .join(",")))?;
-                                        writeln!(log, "-- Practical A:   {}", pg_a.clone().unwrap_or_default())?;
-                                        writeln!(log, "-- Extra A:       {}", format!("{{{}}}", extra_a.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")))?;
-                                        writeln!(log, "-- Theoretical U: {}", format!("{{{}}}", theoretical_u.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")))?;
-                                        writeln!(log, "-- Practical U:   {}", pg_u.clone().unwrap_or_default())?;
-                                        writeln!(log, "-- Extra U:       {}", format!("{{{}}}", extra_u.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")))?;
+                                        writeln!(log, "-- Practical A:   {}", format!("{{{}}}", pg_practical.as_ref()
+                                            .and_then(|(a, _)| a.as_ref())
+                                            .unwrap_or(&String::new())))?;
+                                        writeln!(log, "-- Theoretical U: {}", format!("{{{}}}", theoretical_u.iter()
+                                            .map(|s| s.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join(",")))?;
+                                        writeln!(log, "-- Practical U:   {}", pg_practical.as_ref()
+                                            .and_then(|(_, u)| u.as_ref())
+                                            .unwrap_or(&String::new()))?;
                                         writeln!(log)?;
 
                                         // Write all SQL statements
@@ -1454,18 +1501,32 @@ fn run_fuzzer(args: &Args) -> Result<(), Box<dyn Error>> {
                         .map(|(k, v)| format!("{}:{{{}}}", k.as_str(), v.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")))
                         .collect::<Vec<_>>()
                         .join(",")))?;
-                    writeln!(log, "-- Practical A:   {}", format!("{{{}}}", pg_practical.as_ref().unwrap_or(&(None, None)).0.clone().unwrap_or_default()))?;
-                    writeln!(log, "-- Theoretical U: {}", format!("{{{}}}", theoretical_u.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")))?;
-                    writeln!(log, "-- Practical U:   {}", format!("{{{}}}", pg_practical.as_ref().unwrap_or(&(None, None)).1.clone().unwrap_or_default()))?;
+                    writeln!(log, "-- Practical A:   {}", pg_practical.as_ref()
+                        .and_then(|(a, _)| a.as_ref())
+                        .unwrap_or(&String::new()))?;
+                    writeln!(log, "-- Theoretical U: {}", format!("{{{}}}", theoretical_u.iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")))?;
+                    writeln!(log, "-- Practical U:   {}", pg_practical.as_ref()
+                        .and_then(|(_, u)| u.as_ref())
+                        .unwrap_or(&String::new()))?;
                     writeln!(log)?;
 
                     // Write all SQL statements
                     for sql in &output {
                         writeln!(log, "{}", sql)?;
                     }
-                    writeln!(log, "\n\n")?;  // Add extra newline before view
+                    writeln!(log, "\n\n")?;
                     writeln!(log, "{}", view_sql)?;
-                    writeln!(log, "\n\n")?;  // Add extra newline before verification
+                    writeln!(log, "\n-- Foreign Key Join Tests")?;
+                    if let Some(test) = &valid_test {
+                        writeln!(log, "{}\n", test)?;
+                    }
+                    if let Some(test) = &invalid_test {
+                        writeln!(log, "{}\n", test)?;
+                    }
+                    writeln!(log, "\n-- Verification query")?;
                     writeln!(log, "{}", verify_sql)?;
                     writeln!(log, "\n")?;
 
@@ -1570,9 +1631,10 @@ impl FromStr for Database {
     }
 }
 
-fn create_view_sql(first_table: &str, joins: &[JoinInfo], table_aliases: &[(String, String)], join_syntax: &str) -> String {
+fn create_view_sql(first_table: &str, joins: &[JoinInfo], table_aliases: &[(String, String)], join_syntax: &str, tables: &[Table]) -> String {
     let mut sql = String::from("-- This view represents the derived table created by the join sequence.\n");
     sql.push_str("-- Each table's ID is selected to track which rows from the base tables appear in the result.\n");
+    sql.push_str("-- All UNIQUE columns are also included to support foreign key joins against the view.\n");
 
     if join_syntax.to_uppercase() == "KEY" {
         sql.push_str("-- The join sequence uses the KEY syntax to specify foreign key relationships.\n");
@@ -1583,10 +1645,21 @@ fn create_view_sql(first_table: &str, joins: &[JoinInfo], table_aliases: &[(Stri
 
     sql.push_str("CREATE VIEW v AS\nSELECT\n");
 
+    // First add all ID columns
     let id_columns: Vec<_> = table_aliases.iter()
         .map(|(_, alias)| format!("    {}.id AS {}_id", alias, alias))
         .collect();
     sql.push_str(&id_columns.join(",\n"));
+
+    // Then add all UNIQUE columns from each table
+    for (table_name, alias) in table_aliases {
+        let table = tables.iter().find(|t| t.name == *table_name).unwrap();
+        for column in &table.columns {
+            if column.is_unique && column.name != "id" {
+                sql.push_str(&format!(",\n    {}.{} AS {}_{}", alias, column.name, alias, column.name));
+            }
+        }
+    }
     sql.push_str("\n");
 
     sql.push_str(&format!("FROM {}\n", first_table));
@@ -1642,4 +1715,55 @@ fn create_verify_sql(table_aliases: &[(String, String)]) -> String {
     sql.push_str("FROM A_tables \nWHERE table_name IS NOT NULL;");
 
     sql
+}
+
+fn create_fk_join_tests(tables: &[Table], first_table: &str, joins: &[JoinInfo], theoretical_a: &std::collections::HashMap<String, std::collections::HashSet<String>>, theoretical_u: &std::collections::HashSet<String>) -> (Option<String>, Option<String>) {
+    let mut valid_test = None;
+    let mut invalid_test = None;
+
+    // Build a map of table names to their aliases in the view
+    let mut table_aliases = std::collections::HashMap::new();
+    table_aliases.insert(first_table.to_string(), first_table.to_string());
+    for join in joins {
+        table_aliases.insert(join.new_table.clone(), join.new_alias.clone());
+    }
+
+    // Find tables that have foreign keys referencing tables in our view
+    'outer: for table in tables {
+        for column in &table.columns {
+            if let Some((ref_table, ref_col)) = &column.reference {
+                // Check if the referenced table is in our view (either as first table or through a join)
+                if let Some(ref_alias) = table_aliases.get(ref_table) {
+                    // Check if this referenced table is both in A and U (positive test)
+                    if valid_test.is_none() && theoretical_a.get(ref_alias).map(|s| s.contains(ref_alias)).unwrap_or(false) && theoretical_u.contains(ref_alias) {
+                        let mut sql = String::new();
+                        sql.push_str("-- Valid Foreign Key Join test\n");
+                        sql.push_str("-- This join should succeed since the referenced columns are from a relation\n");
+                        sql.push_str("-- that both preserves all rows and preserves uniqueness.\n");
+                        sql.push_str(&format!("SELECT COUNT(*)\nFROM v\nJOIN {} KEY ({}) -> v ({}_{});",
+                            table.name, column.name, ref_alias, ref_col));
+                        valid_test = Some(sql);
+                    }
+                    // Check if this referenced table is NOT both in A and U (negative test)
+                    else if invalid_test.is_none() && (!theoretical_a.get(ref_alias).map(|s| s.contains(ref_alias)).unwrap_or(false) || !theoretical_u.contains(ref_alias)) {
+                        let mut sql = String::new();
+                        sql.push_str("-- Invalid Foreign Key Join test\n");
+                        sql.push_str("-- This join should fail with 'virtual foreign key constraint violation'\n");
+                        sql.push_str("-- since the referenced columns are from a relation that does NOT both\n");
+                        sql.push_str("-- preserve all rows and preserve uniqueness.\n");
+                        sql.push_str(&format!("SELECT COUNT(*)\nFROM v\nJOIN {} KEY ({}) -> v ({}_{});",
+                            table.name, column.name, ref_alias, ref_col));
+                        invalid_test = Some(sql);
+                    }
+
+                    // If we have both a valid and invalid test, we can stop
+                    if valid_test.is_some() && invalid_test.is_some() {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+
+    (valid_test, invalid_test)
 }
