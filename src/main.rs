@@ -359,6 +359,7 @@ fn verify_derived_table(first_table: &str, joins: &[JoinInfo]) -> (std::collecti
         return (std::collections::HashMap::new(), std::collections::HashSet::new());
     }
 
+    // Initialize A and U with first table
     let mut a = std::collections::HashMap::new();
     a.insert(first_table.to_string(), std::collections::HashSet::from([first_table.to_string()]));
     let mut u = std::collections::HashSet::from([first_table.to_string()]);
@@ -369,59 +370,65 @@ fn verify_derived_table(first_table: &str, joins: &[JoinInfo]) -> (std::collecti
             FKDir::Forward => (join.existing_alias.clone(), join.new_alias.clone()),
         };
 
-        let existing_rel_preserves_rows = a.contains_key(&existing_alias) && join.fk_cols_not_null;
-        let existing_rel_self_preserving = a.get(&existing_alias).map(|s| s.contains(&existing_alias)).unwrap_or(false) && join.fk_cols_not_null;
+        // Calculate A_inner based on conditions
+        let mut a_inner = std::collections::HashMap::new();
+        if join.fk_cols_not_null {
+            let preserves_rows = a.contains_key(&existing_alias);
+            let self_preserving = a.get(&existing_alias)
+                .map(|s| s.contains(&existing_alias))
+                .unwrap_or(false);
 
-        // Update A based on join type and conditions
-        match (join.join_type, join.arrow, existing_rel_preserves_rows) {
-            (JoinType::Left, _, _) | (JoinType::Full, _, _) => {
-                // A = A (no change)
-            },
-            (JoinType::Right, FKDir::Backward, true) | (JoinType::Inner, FKDir::Backward, true) => {
-                // For each key in A, intersect its value set with A[existing_rel]
-                let existing_set = a.get(&existing_alias).cloned().unwrap_or_default();
-                for set in a.values_mut() {
-                    *set = set.intersection(&existing_set).cloned().collect();
-                }
-                // Add new relation with same preserved set as existing relation
-                a.insert(new_alias.clone(), existing_set);
-            },
-            (JoinType::Right, FKDir::Forward, true) | (JoinType::Inner, FKDir::Forward, true) => {
-                // For each key in A, if it preserves existing_rel, it now only preserves new_rel
-                let keys: Vec<_> = a.keys().cloned().collect();
-                for key in keys {
-                    if let Some(set) = a.get_mut(&key) {
-                        if set.contains(&existing_alias) {
-                            set.clear();
-                            set.insert(new_alias.clone());
-                        } else {
-                            set.clear();
-                        }
+            if matches!(join.arrow, FKDir::Forward) && self_preserving {
+                // For each key in A, if existing_rel in A[key], then A_inner[key] = {new_rel}
+                for (key, value) in a.iter() {
+                    if value.contains(&existing_alias) {
+                        let mut new_set = std::collections::HashSet::new();
+                        new_set.insert(new_alias.clone());
+                        a_inner.insert(key.clone(), new_set);
                     }
                 }
-            },
-            (JoinType::Right, _, false) | (JoinType::Inner, _, false) => {
-                a.clear();
-            },
+                // Also add A_inner[new_rel] = {new_rel}
+                let mut new_set = std::collections::HashSet::new();
+                new_set.insert(new_alias.clone());
+                a_inner.insert(new_alias.clone(), new_set);
+            } else if matches!(join.arrow, FKDir::Backward) && preserves_rows {
+                // For each key in A, A_inner[key] = A[key] & A[existing_rel]
+                let existing_set = a.get(&existing_alias).cloned().unwrap_or_default();
+                for (key, value) in a.iter() {
+                    let intersection: std::collections::HashSet<_> = value.intersection(&existing_set).cloned().collect();
+                    a_inner.insert(key.clone(), intersection);
+                }
+                // Also add A_inner[new_rel] = A[existing_rel]
+                a_inner.insert(new_alias.clone(), existing_set);
+            }
         }
 
-        // Update A based on self-preservation conditions
-        match (join.join_type, join.arrow, existing_rel_self_preserving) {
-            (JoinType::Right, _, _) | (JoinType::Full, _, _) => {
+        // Update A based on join type
+        match join.join_type {
+            JoinType::Inner => {
+                a = a_inner;
+            },
+            JoinType::Left => {
+                // A = A | A_inner
+                for (key, value) in a_inner {
+                    a.entry(key).or_default().extend(value);
+                }
+            },
+            JoinType::Right => {
+                // A = A_inner | {new_rel: {new_rel}}
+                a = a_inner;
                 let mut new_set = std::collections::HashSet::new();
                 new_set.insert(new_alias.clone());
                 a.insert(new_alias.clone(), new_set);
             },
-            (JoinType::Left, FKDir::Forward, true) | (JoinType::Inner, FKDir::Forward, true) => {
+            JoinType::Full => {
+                // A = A | A_inner | {new_rel: {new_rel}}
+                for (key, value) in a_inner {
+                    a.entry(key).or_default().extend(value);
+                }
                 let mut new_set = std::collections::HashSet::new();
                 new_set.insert(new_alias.clone());
                 a.insert(new_alias.clone(), new_set);
-            },
-            (JoinType::Left, FKDir::Forward, false) | (JoinType::Inner, FKDir::Forward, false) => {
-                // A = A (no change)
-            },
-            (JoinType::Left, FKDir::Backward, _) | (JoinType::Inner, FKDir::Backward, _) => {
-                // A = A (no change)
             },
         }
 
