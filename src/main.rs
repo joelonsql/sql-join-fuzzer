@@ -15,6 +15,9 @@ use std::error::Error;
 use ctrlc;
 use std::str::FromStr;
 
+mod fk_join_test;
+use fk_join_test::handle_fk_join_test;
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -416,19 +419,28 @@ fn verify_derived_table(first_table: &str, joins: &[JoinInfo]) -> (std::collecti
             },
             JoinType::Right => {
                 // A = A_inner | {new_rel: {new_rel}}
+                // First preserve a_inner mappings
                 a = a_inner;
+                // Then add new_rel: {new_rel} mapping while preserving any existing mappings
                 let mut new_set = std::collections::HashSet::new();
                 new_set.insert(new_alias.clone());
-                a.insert(new_alias.clone(), new_set);
+                a.entry(new_alias.clone())
+                    .and_modify(|set| { set.insert(new_alias.clone()); })
+                    .or_insert(new_set);
             },
             JoinType::Full => {
                 // A = A | A_inner | {new_rel: {new_rel}}
+                // First preserve existing A mappings (no change needed)
+                // Then add A_inner mappings
                 for (key, value) in a_inner {
                     a.entry(key).or_default().extend(value);
                 }
+                // Finally add new_rel: {new_rel} mapping
                 let mut new_set = std::collections::HashSet::new();
                 new_set.insert(new_alias.clone());
-                a.insert(new_alias.clone(), new_set);
+                a.entry(new_alias.clone())
+                    .and_modify(|set| { set.insert(new_alias.clone()); })
+                    .or_insert(new_set);
             },
         }
 
@@ -943,6 +955,13 @@ fn run_fuzzer(args: &Args) -> Result<(), Box<dyn Error>> {
 
                 // Create view and verification queries
                 let (theoretical_a, theoretical_u) = verify_derived_table(&first_table, &joins);
+                println!("\nTheoretical sets:");
+                println!("A: {}", format!("{{{}}}", theoretical_a.iter()
+                    .map(|(k, v)| format!("{}:{{{}}}", k.as_str(), v.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")))
+                    .collect::<Vec<_>>()
+                    .join(",")));
+                println!("U: {}", format!("{{{}}}", theoretical_u.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")));
+                println!("");  // Extra line for status messages
                 let view_sql = create_view_sql(&first_table, &joins, &table_aliases, &args.join_syntax, &tables);
                 let verify_sql = create_verify_sql(&table_aliases);
                 let (valid_test, invalid_test) = create_fk_join_tests(&tables, &first_table, &joins, &theoretical_a, &theoretical_u);
@@ -965,17 +984,6 @@ fn run_fuzzer(args: &Args) -> Result<(), Box<dyn Error>> {
                 }
                 writeln!(current_sql, "\n-- Verification query")?;
                 writeln!(current_sql, "{}", verify_sql)?;
-
-                // Get theoretical results
-                let (theoretical_a, theoretical_u) = verify_derived_table(&first_table, &joins);
-
-                // Print the theoretical sets
-                println!("A: {}", format!("{{{}}}", theoretical_a.iter()
-                    .map(|(k, v)| format!("{}:{{{}}}", k.as_str(), v.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")))
-                    .collect::<Vec<_>>()
-                    .join(",")));
-                println!("U: {}", format!("{{{}}}", theoretical_u.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")));
-                println!("");  // Extra line for status messages
 
                 let mut pg_practical = None;
                 let mut sqlite_practical = None;
@@ -1059,9 +1067,14 @@ fn run_fuzzer(args: &Args) -> Result<(), Box<dyn Error>> {
 
                             // Execute valid test if present
                             if let Some(test) = valid_test {
-                                if let Err(e) = client.batch_execute(&test) {
-                                    let error_msg = e.to_string();
-                                    let filename = save_error_sql(&output, &format!("Valid foreign key join failed: {}", error_msg), Some(&test), Some(&view_sql));
+                                let table_sql = output.iter()
+                                    .take_while(|line| !line.starts_with("CREATE VIEW"))
+                                    .map(|s| s.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                if let Err(e) = handle_fk_join_test(&test, &view_sql, &table_sql, true, &theoretical_a, &theoretical_u) {
+                                    eprintln!("Error handling valid FK join test: {}", e);
+                                    let filename = save_error_sql(&output, &format!("Valid foreign key join test failed: {}", e), Some(&test), Some(&view_sql));
                                     eprintln!("SQL saved to {}", filename);
                                     std::process::exit(1);
                                 }
@@ -1069,20 +1082,16 @@ fn run_fuzzer(args: &Args) -> Result<(), Box<dyn Error>> {
 
                             // Execute invalid test if present
                             if let Some(test) = invalid_test {
-                                match client.batch_execute(&test) {
-                                    Ok(_) => {
-                                        let filename = save_error_sql(&output, &"Invalid foreign key join did not fail as expected", Some(&test), Some(&view_sql));
-                                        eprintln!("SQL saved to {}", filename);
-                                        std::process::exit(1);
-                                    },
-                                    Err(e) => {
-                                        let error_msg = e.to_string();
-                                        if !error_msg.contains("virtual foreign key constraint violation") {
-                                            let filename = save_error_sql(&output, &format!("Invalid foreign key join failed with wrong error: {}", error_msg), Some(&test), Some(&view_sql));
-                                            eprintln!("SQL saved to {}", filename);
-                                            std::process::exit(1);
-                                        }
-                                    }
+                                let table_sql = output.iter()
+                                    .take_while(|line| !line.starts_with("CREATE VIEW"))
+                                    .map(|s| s.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                if let Err(e) = handle_fk_join_test(&test, &view_sql, &table_sql, false, &theoretical_a, &theoretical_u) {
+                                    eprintln!("Error handling invalid FK join test: {}", e);
+                                    let filename = save_error_sql(&output, &format!("Invalid foreign key join test failed: {}", e), Some(&test), Some(&view_sql));
+                                    eprintln!("SQL saved to {}", filename);
+                                    std::process::exit(1);
                                 }
                             }
                             println!("Foreign key join tests time: {:?}", start.elapsed());
@@ -1156,6 +1165,8 @@ fn run_fuzzer(args: &Args) -> Result<(), Box<dyn Error>> {
                                             view_sql: Some(view_sql.clone()),
                                         }
                                     )));
+                                } else {
+                                    println!("\nTheoretical and practical results match!");
                                 }
 
                                 if !extra_a.is_empty() {
@@ -1176,9 +1187,9 @@ fn run_fuzzer(args: &Args) -> Result<(), Box<dyn Error>> {
                                             .map(|(k, v)| format!("{}:{{{}}}", k.as_str(), v.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")))
                                             .collect::<Vec<_>>()
                                             .join(",")))?;
-                                        writeln!(log, "-- Practical A:   {}", format!("{{{}}}", pg_practical.as_ref()
+                                        writeln!(log, "-- Practical A:   {}", pg_practical.as_ref()
                                             .and_then(|(a, _)| a.as_ref())
-                                            .unwrap_or(&String::new())))?;
+                                            .unwrap_or(&String::new()))?;
                                         writeln!(log, "-- Theoretical U: {}", format!("{{{}}}", theoretical_u.iter()
                                             .map(|s| s.as_str())
                                             .collect::<Vec<_>>()
@@ -1512,6 +1523,11 @@ fn run_fuzzer(args: &Args) -> Result<(), Box<dyn Error>> {
                         .and_then(|(_, u)| u.as_ref())
                         .unwrap_or(&String::new()))?;
                     writeln!(log)?;
+
+                    // Add schema setup statements
+                    writeln!(log, "DROP SCHEMA IF EXISTS {} CASCADE;", args.db_name)?;
+                    writeln!(log, "CREATE SCHEMA {};", args.db_name)?;
+                    writeln!(log, "SET search_path TO {};\n", args.db_name)?;
 
                     // Write all SQL statements
                     for sql in &output {
