@@ -15,7 +15,6 @@ use crate::ErrorContext;
 fn parse_a_map(content: &str) -> HashMap<String, HashSet<String>> {
     let mut result = HashMap::new();
     let mut remainder = content.trim();
-    let mut segment_index = 0;
 
     while !remainder.is_empty() {
         let colon_pos = match remainder.find(':') {
@@ -72,7 +71,6 @@ fn parse_a_map(content: &str) -> HashMap<String, HashSet<String>> {
             remainder = &remainder[1..].trim();
         }
 
-        segment_index += 1;
     }
 
     result
@@ -102,7 +100,6 @@ pub fn handle_fk_join_test(
         .args(["-a", "-f", &temp_file, "joinfuzzer"])
         .output()?;
 
-    let stdout_str = String::from_utf8_lossy(&output.stdout);
     let stderr_str = String::from_utf8_lossy(&output.stderr);
 
     let mut theoretical_a = HashMap::new();
